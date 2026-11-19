@@ -1,0 +1,912 @@
+# streaming_providers/providers/rtlplus/provider.py
+
+import time
+from datetime import datetime
+from typing import ClassVar, Dict, List, Optional, Tuple, Any
+from ..lib_drmtoday import create_drmtoday_configs
+
+from ...base.models import DRMConfig, StreamingChannel, Event
+from ...base.models.proxy_models import ProxyConfig
+from ...base.provider import StreamingProvider
+from ...base.utils import logger
+from ...base.models.favorite import FavoriteType, Favorite
+from .auth import RTLPlusAuthenticator
+from .constants import RTLPlusConfig, RTLPlusDefaults
+from .layout_helpers import unwrap_target
+from .vod_manager import RTLPlusVodManager
+from .channel_manager import RTLPlusChannelManager
+from .event_manager import RTLPlusEventManager
+from .favorite_manager import RTLPlusFavoriteManager
+
+_MANIFEST_CACHE_TTL = 86400  # 1 day in seconds for VOD/events
+
+
+class RTLPlusProvider(StreamingProvider):
+    # Provider constants
+    PROVIDER_LABEL: ClassVar[str] = "RTL+"
+    PROVIDER_LOGO: ClassVar[str] = RTLPlusDefaults.RTLPLUS_LOGO
+    SUPPORTED_AUTH_TYPES: ClassVar[List[str]] = [
+        "client_credentials",
+        "user_credentials",
+    ]
+
+    def __init__(
+            self,
+            country: str = "DE",
+            config: Optional[Dict] = None,
+            proxy_config: Optional[ProxyConfig] = None,
+    ):
+        super().__init__(country)
+
+        # Initialize configuration
+        self.rtl_config = RTLPlusConfig(config)
+
+        # Setup HTTP manager
+        self.http_manager = self._setup_http_manager(
+            provider_name="rtlplus",
+            proxy_config=proxy_config,
+            user_agent=self.rtl_config.user_agent,
+            timeout=self.rtl_config.timeout,
+        )
+
+        # Initialize authenticator
+        self.authenticator = RTLPlusAuthenticator(
+            client_version=self.rtl_config.client_version,
+            device_id=self.rtl_config.device_id,
+            proxy_config=proxy_config,
+            http_manager=self.http_manager,
+        )
+
+        self.http_manager = self._share_http_manager_with_authenticator(self.authenticator)
+
+        # Layout cache (shared across all layout types)
+        self._layout_cache: Dict[str, Tuple[Dict, float]] = {}
+        self.LAYOUT_CACHE_TTL = RTLPlusDefaults.LAYOUT_CACHE_TTL
+
+        # Try authentication
+        try:
+            self.bearer_token = self.authenticator.get_bearer_token()
+
+            # Ensure a profile is selected for user-authenticated sessions
+            if self.authenticator.has_user_credentials():
+                self.authenticator.ensure_profile_selected()
+
+        except Exception as e:
+            logger.warning(f"RTL+ could not authenticate during initialization: {e}")
+            self.bearer_token = None
+
+        # Initialize managers
+        self._vod_manager = RTLPlusVodManager(self)
+        self.channel_manager = RTLPlusChannelManager(self)
+        self.event_manager = RTLPlusEventManager(self)
+        self._favorite_manager = RTLPlusFavoriteManager(self)
+
+        # Manifest cache for VOD/events
+        self._manifest_cache: Dict[str, tuple] = {}
+
+    @property
+    def provider_name(self) -> str:
+        return "rtlplus"
+
+    @property
+    def provider_label(self) -> str:
+        return "RTL+"
+
+    @property
+    def provider_logo(self) -> str:
+        return self.PROVIDER_LOGO
+
+    @property
+    def uses_dynamic_manifests(self) -> bool:
+        return False
+
+    @property
+    def implements_epg(self) -> bool:
+        return False
+
+    @property
+    def supported_auth_types(self) -> List[str]:
+        return ["user_credentials"]
+
+    @property
+    def implements_vod(self) -> bool:
+        """RTL+ has a browsable VOD catalogue."""
+        return True
+
+    @property
+    def implements_favorites(self) -> bool:
+        """RTL+ supports program bookmarks."""
+        return True
+
+    def get_favorites(self, **kwargs) -> List[Favorite]:
+        """Get all bookmarked programs for the authenticated user."""
+        return self._favorite_manager.get_favorites(**kwargs)
+
+    def add_favorite(
+            self,
+            content_id: str,
+            favorite_type: FavoriteType,
+            title: Optional[str] = None,
+            **kwargs,
+    ) -> Optional[Favorite]:
+        """Add a program to user's bookmarks."""
+        return self._favorite_manager.add_favorite(
+            content_id=content_id,
+            favorite_type=favorite_type,
+            title=title,
+            **kwargs,
+        )
+
+    def remove_favorite(self, content_id: str, **kwargs) -> None:
+        """Remove a program from user's bookmarks."""
+        self._favorite_manager.remove_favorite(content_id=content_id, **kwargs)
+
+    def is_favorited(self, content_id: str) -> bool:
+        """Check if a specific program is bookmarked."""
+        return self._favorite_manager.is_favorited(content_id)
+
+    # --------------------------------------------------------------------------
+    # Common Layout Methods
+    # --------------------------------------------------------------------------
+
+    def fetch_layout(
+            self,
+            layout_type: str,
+            content_id: str,
+            block_page: int = None,
+            nb_pages: int = None,
+            location: str = None,
+            force_refresh: bool = False,
+            **kwargs,
+    ) -> Optional[Dict]:
+        """
+        Fetch any layout (live/video/folder/program/block/alias/search) with caching.
+        """
+        if block_page is None:
+            block_page = RTLPlusDefaults.DEFAULT_BLOCK_PAGE
+        if nb_pages is None:
+            nb_pages = RTLPlusDefaults.DEFAULT_NB_PAGES
+
+        # Strip known type prefixes so the correct URL and cache key are used
+        clean_content_id = content_id
+        if layout_type == "program" and content_id.startswith("program_"):
+            clean_content_id = content_id[8:]
+        elif layout_type == "folder" and content_id.startswith("folder_"):
+            clean_content_id = content_id[7:]
+        elif layout_type == "season" and content_id.startswith("season_"):
+            clean_content_id = content_id[7:]
+
+        # For video layouts, a prefix is always an error
+        if layout_type == "video" and "_" in content_id and not content_id.startswith("clip"):
+            logger.error(
+                f"fetch_layout: 'video' layout requested with non-clip content_id '{content_id}'. "
+                f"Pass the clip_id (e.g. 'clip_1417600') instead."
+            )
+            return None
+
+        # Build cache key (include query for search)
+        if layout_type == "search":
+            query = kwargs.get("query", "")
+            cache_key = f"{layout_type}:{query}:{block_page}:{nb_pages}"
+        else:
+            cache_key = f"{layout_type}:{clean_content_id}:{block_page}:{nb_pages}"
+        now = time.time()
+
+        if not force_refresh and cache_key in self._layout_cache:
+            cached_data, cached_time = self._layout_cache[cache_key]
+            if (now - cached_time) < self.LAYOUT_CACHE_TTL:
+                return cached_data
+
+        # Get tokens
+        oauth_token = self.get_user_bearer_token()
+        if not oauth_token:
+            try:
+                oauth_token = self.authenticator.get_bearer_token()
+            except Exception as e:
+                logger.error(f"Failed to get OAuth token for layout: {e}")
+                return None
+
+        try:
+            bedrock_token = self.authenticator.get_bedrock_token()
+        except Exception as e:
+            logger.error(f"Failed to get Bedrock token for layout: {e}")
+            return None
+
+        # Auto-generate location header if not provided
+        if location is None and layout_type in ("live", "video", "folder", "program", "alias"):
+            location = f"{self.rtl_config.base_website}{clean_content_id}"
+
+        # Build request - handle special layout types
+        if layout_type == "alias":
+            url = f"{self.rtl_config.bedrock_layout_base}/alias/{clean_content_id}/layout"
+        elif layout_type == "search":
+            url = f"{self.rtl_config.bedrock_layout_base}/frontspace/search/layout"
+            # Validate query parameter for search
+            query = kwargs.get("query")
+            if not query:
+                logger.error("fetch_layout: 'search' layout requires 'query' parameter")
+                return None
+        else:
+            url = self.rtl_config.get_layout_url(layout_type, clean_content_id)
+
+        headers = self.rtl_config.get_layout_headers(oauth_token, bedrock_token, location)
+        params = {"blockPage": block_page, "nbPages": nb_pages}
+
+        # Add query parameter for search
+        if layout_type == "search":
+            params["query"] = kwargs.get("query")
+
+        try:
+            response = self.http_manager.get(
+                url, headers=headers, params=params, operation="api"
+            )
+            response.raise_for_status()
+            data = response.json()
+
+            self._layout_cache[cache_key] = (data, now)
+            return data
+
+        except Exception as e:
+            logger.error(f"Failed to fetch {layout_type} layout for {clean_content_id}: {e}")
+            return None
+
+    def fetch_block_page(
+            self,
+            block_id: str,
+            page: int,
+            nb_pages: int = 3,
+            service_id: str = "rtlplus_root",
+    ) -> Optional[Dict]:
+        """
+        Fetch a specific page of a service block from the Bedrock API.
+
+        URL pattern: /service/{service_id}/block/{block_id}?nbPages={nb_pages}&page={page}
+
+        This is intentionally separate from ``fetch_layout`` because the service/block
+        endpoint uses different URL structure and query parameters (``page`` / ``nbPages``
+        instead of ``blockPage`` / ``nbPages``), and its responses are not cached — the
+        same page number may return different content as events are added or removed.
+
+        Args:
+            block_id:   Full block ID as returned by the layout API, e.g.
+                        ``"page_69fcecf6347a02.20778370--6294a9fc-55a7-43cf-aa18-e27f1bd1a2c3"``
+            page:       Page number to fetch.  May be non-sequential (1 → 3 → 6 → …)
+                        as dictated by the API's ``pagination.nextPage`` field.
+            nb_pages:   Number of pages to request per call (default 3, matching API default).
+            service_id: Bedrock service identifier (default ``"rtlplus_root"``).
+
+        Returns:
+            Parsed JSON response dict, or ``None`` on failure.
+        """
+        url = f"{self.rtl_config.bedrock_layout_base}/service/{service_id}/block/{block_id}"
+        params = {"nbPages": nb_pages, "page": page}
+
+        oauth_token = self.get_user_bearer_token() or self.authenticator.get_bearer_token()
+        if not oauth_token:
+            logger.error("No OAuth token available for fetch_block_page")
+            return None
+
+        try:
+            bedrock_token = self.authenticator.get_bedrock_token()
+        except Exception as e:
+            logger.error(f"Failed to get Bedrock token for fetch_block_page: {e}")
+            return None
+
+        if not bedrock_token:
+            logger.error("No Bedrock token available for fetch_block_page")
+            return None
+
+        location = f"{self.rtl_config.base_website}"
+        headers = self.rtl_config.get_layout_headers(oauth_token, bedrock_token, location)
+
+        try:
+            response = self.http_manager.get(url, headers=headers, params=params, operation="api")
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            logger.error(f"Failed to fetch block page {page} for {block_id}: {e}")
+            return None
+
+    @staticmethod
+    def extract_video_assets(layout_data: Dict) -> List[Dict]:
+        """
+        Extract video assets from a layout response.
+        """
+        assets = []
+        blocks = layout_data.get("blocks", [])
+
+        for block in blocks:
+            if block.get("type") != "bffPaginated":
+                continue
+
+            items = block.get("content", {}).get("items", [])
+            for item in items:
+                if item.get("itemType") == "video":
+                    video_assets = item.get("itemContent", {}).get("video", {}).get("assets", [])
+                    assets.extend(video_assets)
+                elif item.get("itemType") == "classic":
+                    # Some layouts wrap video inside classic items
+                    video_assets = item.get("itemContent", {}).get("video", {}).get("assets", [])
+                    assets.extend(video_assets)
+
+        return assets
+
+    @staticmethod
+    def _extract_items_from_block(
+            layout_data: Dict,
+            block_type: str = None,
+            item_type: str = None
+    ) -> List[Dict]:
+        """
+        Extract items from layout blocks with optional filtering.
+
+        Args:
+            layout_data: Layout JSON
+            block_type: Filter blocks by type (e.g., 'bffPaginated')
+            item_type: Filter items by itemType (e.g., 'classic', 'video')
+
+        Returns:
+            List of item dictionaries
+        """
+        items = []
+        blocks = layout_data.get("blocks", [])
+
+        for block in blocks:
+            if block_type and block.get("type") != block_type:
+                continue
+
+            block_items = block.get("content", {}).get("items", [])
+            for item in block_items:
+                if item_type and item.get("itemType") != item_type:
+                    continue
+                items.append(item)
+
+        return items
+
+    @staticmethod
+    def _get_pagination_info(layout_data: Dict, block_id: str = None) -> Dict:
+        """
+        Extract pagination info from layout or specific block.
+        """
+        if block_id:
+            for block in layout_data.get("blocks", []):
+                if block.get("id") == block_id or block.get("blockId") == block_id:
+                    return block.get("content", {}).get("pagination", {})
+
+        # Fallback: look for pagination at top level
+        return layout_data.get("pagination", {})
+
+    def extract_best_manifest_url(
+            self,
+            assets: List[Dict],
+            preferred_quality: str = None,
+            preferred_format: str = None,
+            drm_variant: str = "auto",
+    ) -> Optional[str]:
+        """
+        Extract the best manifest URL from assets based on preferences and DRM variant.
+
+        Args:
+            assets: List of video assets from layout
+            preferred_quality: 'hd' or 'sd' (default from config)
+            preferred_format: 'dashcenc' or 'hlsfp' (default from config)
+            drm_variant: 'auto' (prefer hardware, fallback software),
+                         'software' (force software only),
+                         'hardware' (force hardware only)
+
+        Returns:
+            Manifest URL or None if no suitable asset found
+        """
+        quality = preferred_quality or next(iter(self.rtl_config.preferred_qualities), "hd")
+        format_pref = preferred_format or next(iter(self.rtl_config.preferred_formats), "dashcenc")
+
+        def asset_score(asset: Dict) -> int:
+            drm_type = asset.get("drm", {}).get("type", "")
+
+            if drm_variant == "software":
+                if drm_type != "software":
+                    return -1
+                score = 1000
+            elif drm_variant == "hardware":
+                if drm_type != "hardware":
+                    return -1
+                score = 1000
+            else:  # "auto"
+                if drm_type == "hardware":
+                    score = 1000
+                elif drm_type == "software":
+                    score = 500
+                else:
+                    score = 0
+
+            if asset.get("quality") == quality:
+                score += 100
+            if asset.get("format") == format_pref:
+                score += 10
+
+            return score
+
+        scored_assets = [(asset_score(a), a) for a in assets if asset_score(a) >= 0]
+
+        if not scored_assets:
+            logger.warning(f"No assets found matching drm_variant='{drm_variant}'")
+            return None
+
+        scored_assets.sort(key=lambda x: x[0], reverse=True)
+        best_asset = scored_assets[0][1]
+
+        manifest_url = best_asset.get("path") or best_asset.get("reference")
+        if manifest_url:
+            drm_type = best_asset.get("drm", {}).get("type", "unknown")
+            logger.debug(
+                f"Selected manifest: quality={best_asset.get('quality')}, "
+                f"format={best_asset.get('format')}, drm={drm_type}, "
+                f"drm_variant={drm_variant}"
+            )
+        else:
+            logger.warning(f"Best asset has no manifest URL: {best_asset}")
+
+        return manifest_url
+
+    def invalidate_layout_cache(self, cache_key: str = None):
+        """Invalidate layout cache for a specific key or all keys."""
+        if cache_key:
+            self._layout_cache.pop(cache_key, None)
+        else:
+            self._layout_cache.clear()
+
+    # --------------------------------------------------------------------------
+    # Authentication Helpers
+    # --------------------------------------------------------------------------
+
+    def _get_rtlplus_authenticated_headers(self) -> Dict[str, str]:
+        from ...base.auth.base_auth import TokenAuthLevel
+
+        try:
+            current_level = self.authenticator.get_current_token_level()
+            force_upgrade = (
+                    self.authenticator.has_user_credentials()
+                    and current_level != TokenAuthLevel.USER_AUTHENTICATED
+            )
+            bearer_token = self.authenticator.get_bearer_token(force_upgrade=force_upgrade)
+        except Exception as e:
+            logger.error(f"Failed to get bearer token: {e}")
+            raise
+
+        return self.rtl_config.get_api_headers(access_token=bearer_token)
+
+    # --------------------------------------------------------------------------
+    # Linear TV Channels
+    # --------------------------------------------------------------------------
+
+    def get_channels(self, **kwargs) -> List[StreamingChannel]:
+        """
+        Get list of available linear TV channels from EPG grid.
+        """
+        try:
+            channels = self.channel_manager.get_channels_as_streaming_channel_list()
+            self.channels = channels
+            return channels
+        except Exception as e:
+            logger.error(f"Error fetching RTL+ channels: {e}")
+            return []
+
+    # --------------------------------------------------------------------------
+    # Events
+    # --------------------------------------------------------------------------
+
+    def get_events(
+            self,
+            start_time: Optional[datetime] = None,
+            end_time: Optional[datetime] = None,
+            **kwargs,
+    ) -> List[Event]:
+        """
+        Fetch upcoming / live RTL+ events from the Bedrock layout API.
+        """
+        folder_id = kwargs.get("folder_id", "6")  # Default to Sport folder
+        return self.event_manager.get_events(
+            folder_id=folder_id,
+            start_time=start_time,
+            end_time=end_time,
+            force_refresh=kwargs.get("force_refresh", False),
+        )
+
+    # --------------------------------------------------------------------------
+    # VOD
+    # --------------------------------------------------------------------------
+
+    def get_vod_category(self, content_id: str = "", **kwargs):
+        return self._vod_manager.get_vod_category(content_id=content_id, **kwargs)
+
+    def search_vod(
+            self,
+            query: str,
+            cursor: Optional[str] = None,
+            page_size: int = 24,
+            **kwargs,
+    ) -> Dict[str, Any]:
+        """
+        Search the RTL+ VOD catalogue.
+
+        Args:
+            query: Search string
+            cursor: Pagination cursor (opaque token)
+            page_size: Number of results per page
+            **kwargs: Additional arguments
+
+        Returns:
+            Dictionary with 'entries', 'next_cursor', and 'total' fields
+        """
+        return self._vod_manager.search_vod(
+            query=query,
+            cursor=cursor,
+            page_size=page_size,
+            **kwargs
+        )
+
+    # --------------------------------------------------------------------------
+    # Manifest & DRM (Unified)
+    # --------------------------------------------------------------------------
+
+    def get_manifest(self, content_id: str, **kwargs) -> Optional[str]:
+        """
+        Get manifest URL for content.
+
+        Supports:
+        - Linear TV channels (via channel_manager)
+        - VOD clips (via layout extraction)
+        - Events (via event_manager)
+
+        content_id may be:
+        - "clip_1417600"
+        - "program_68137" (we need to extract the clip_id from the program)
+        - "program_68137/clip_1417600"
+
+        kwargs:
+        - drm_variant: 'auto' (default), 'software', or 'hardware'
+        - program_context: Program context from VOD navigation
+        """
+        # Extract and validate drm_variant
+        drm_variant = kwargs.pop("drm_variant", RTLPlusDefaults.DEFAULT_DRM_VARIANT)
+        if drm_variant not in RTLPlusDefaults.VALID_DRM_VARIANTS:
+            logger.warning(f"Invalid drm_variant '{drm_variant}', falling back to 'auto'")
+            drm_variant = RTLPlusDefaults.DRM_VARIANT_AUTO
+
+        logger.debug(f"get_manifest called for content_id={content_id}, drm_variant={drm_variant}")
+
+        # Check if we have a stored context from the VOD item
+        if "program_context" in kwargs:
+            if kwargs["program_context"].get("clip_id"):
+                content_id = kwargs["program_context"]["clip_id"]
+
+        # Handle combined paths
+        if "/" in content_id:
+            parts = content_id.split("/")
+            if len(parts) == 2 and parts[0].startswith("program_"):
+                content_id = parts[1]  # clip_1417600
+
+        # If content_id starts with program_, we need to find the clip_id from the program
+        if content_id.startswith("program_"):
+            program_id = content_id[8:]  # Remove "program_" prefix
+            layout = self.fetch_layout(layout_type="program", content_id=program_id)
+            if layout:
+                clip_id = self._find_clip_id_in_program_layout(layout)
+                if clip_id:
+                    content_id = clip_id
+                else:
+                    logger.error(f"No clip_id found for program {program_id}")
+                    return None
+            else:
+                logger.error(f"Failed to fetch program layout for {program_id}")
+                return None
+
+        # Try linear TV channel first
+        if self._is_linear_tv_channel(content_id):
+            return self.channel_manager.get_best_manifest_url(
+                content_id,
+                drm_variant=drm_variant
+            )
+
+        # Try as event (folder)
+        if content_id.isdigit() and int(content_id) > 0:
+            manifest = self.event_manager.get_manifest_for_event(content_id, drm_variant=drm_variant)
+            if manifest:
+                return manifest
+
+        # Fall back to VOD/event manifest extraction
+        return self._get_manifest_vod_or_event(content_id, drm_variant=drm_variant, **kwargs)
+
+    def _find_clip_id_in_program_layout(self, layout: Dict) -> Optional[str]:
+        """Extract the clip_id from a program layout."""
+        if not layout:
+            return None
+
+        # First check if this is a movie (direct video)
+        movie_item = self._vod_manager._find_direct_video_in_layout(layout)
+        if movie_item:
+            return movie_item.content_id
+
+        # Look for video assets in blocks
+        assets = self.extract_video_assets(layout)
+        if assets:
+            for asset in assets:
+                clip_id = asset.get("clipId") or asset.get("id") or asset.get("reference")
+                if clip_id:
+                    return clip_id
+
+        # Check blocks for action targets
+        for block in layout.get("blocks", []):
+            if block.get("type") != "bffPaginated":
+                continue
+            for item in block.get("content", {}).get("items", []):
+                if item.get("itemType") != "classic":
+                    continue
+
+                item_content = item.get("itemContent", {})
+                action = item_content.get("action", {})
+                target = unwrap_target(action.get("target", {}))
+                value_layout = target.get("value_layout", {})
+                if value_layout.get("type") == "video":
+                    return value_layout.get("id")
+
+        return None
+
+    def get_drm(self, content_id: str, **kwargs) -> List[DRMConfig]:
+        """
+        Get DRM configuration for content.
+
+        kwargs:
+        - drm_variant: 'auto' (default), 'software', or 'hardware'
+        """
+        # Extract and validate drm_variant (mirrors get_manifest)
+        drm_variant = kwargs.pop("drm_variant", RTLPlusDefaults.DEFAULT_DRM_VARIANT)
+        if drm_variant not in RTLPlusDefaults.VALID_DRM_VARIANTS:
+            logger.warning(f"Invalid drm_variant '{drm_variant}', falling back to 'auto'")
+            drm_variant = RTLPlusDefaults.DRM_VARIANT_AUTO
+
+        # Handle combined paths and program IDs similar to get_manifest
+        if "/" in content_id:
+            parts = content_id.split("/")
+            if len(parts) == 2 and parts[0].startswith("program_"):
+                content_id = parts[1]
+
+        # If content_id starts with program_, find the clip_id
+        if content_id.startswith("program_"):
+            program_id = content_id[8:]
+            layout = self.fetch_layout(layout_type="program", content_id=program_id)
+            if layout:
+                clip_id = self._find_clip_id_in_program_layout(layout)
+                if clip_id:
+                    content_id = clip_id
+                else:
+                    logger.error(f"No clip_id found for program {program_id} in DRM request")
+                    return []
+            else:
+                logger.error(f"Failed to fetch program layout for {program_id}")
+                return []
+
+        # Try linear TV channel first (drm_variant not yet supported for linear)
+        if self._is_linear_tv_channel(content_id):
+            return self.channel_manager.get_drm_config_for_channel(content_id)
+
+        # Try as event (folder)
+        if content_id.isdigit() and int(content_id) > 0:
+            drm_configs = self.event_manager.get_drm_for_event(content_id, drm_variant=drm_variant)
+            if drm_configs:
+                return drm_configs
+
+        # Fall back to VOD DRM extraction
+        drm_configs = self._get_drm_vod_or_event(content_id, drm_variant=drm_variant, **kwargs)
+        if drm_configs:
+            return drm_configs
+
+        logger.error(f"No DRM configuration found for content_id: {content_id}")
+        return []
+
+    @staticmethod
+    def _is_linear_tv_channel(content_id: str) -> bool:
+        """Determine if content_id refers to a linear TV channel."""
+        if "clip_" in content_id or content_id.startswith("clip"):
+            return False
+        if content_id.startswith("rrn:") or "/" in content_id:
+            return False
+        if content_id.isdigit():
+            return False
+
+        return (
+                ":" not in content_id
+                and not content_id.startswith("rrn:")
+                and not content_id.startswith("/")
+                and not content_id.startswith("http")
+        )
+
+    def _get_manifest_vod_or_event(self, content_id: str, drm_variant: str = "auto", **kwargs) -> Optional[str]:
+        """
+        Get manifest URL for VOD/event content using Bedrock layout extraction.
+
+        Args:
+            content_id: Content identifier (e.g., 'clip_1922663')
+            drm_variant: 'auto', 'software', or 'hardware'
+            **kwargs: Additional arguments (program_slug, program_id, etc.)
+        """
+        if not content_id.startswith("clip_") and content_id.isdigit():
+            logger.warning(f"Non-clip content_id for manifest: {content_id}")
+
+        # Get program context from kwargs (set when navigating from VOD categories)
+        program_slug = kwargs.get("program_slug")
+        program_id = kwargs.get("program_id")
+
+        # Build the correct location header
+        if program_slug and program_id and content_id.startswith("clip_"):
+            clip_slug = f"{program_slug}-c_{content_id.replace('clip_', '')}"
+            location = f"{self.rtl_config.base_website}{program_slug}-p_{program_id}/video/{clip_slug}"
+        else:
+            location = f"{self.rtl_config.base_website}{content_id}"
+
+        layout = self.fetch_layout(
+            layout_type="video",
+            content_id=content_id,
+            location=location
+        )
+
+        if not layout:
+            logger.error(f"Failed to fetch video layout for {content_id}")
+            return None
+
+        assets = self.extract_video_assets(layout)
+
+        if not assets:
+            logger.warning(f"No video assets found for {content_id}")
+            return None
+
+        manifest_url = self.extract_best_manifest_url(assets, drm_variant=drm_variant)
+
+        if not manifest_url:
+            logger.warning(
+                f"No suitable manifest URL found for {content_id} "
+                f"with drm_variant={drm_variant}"
+            )
+
+        return manifest_url
+
+    def _get_drm_vod_or_event(self, content_id: str, drm_variant: str = "auto", **kwargs) -> List[DRMConfig]:
+        """
+        Get DRM configuration for VOD/event content using layout extraction.
+
+        Args:
+            content_id: Content identifier
+            drm_variant: 'auto', 'software', or 'hardware'
+        """
+        layout = self.fetch_layout(
+            layout_type="video",
+            content_id=content_id,
+            location=f"{self.rtl_config.base_website}{content_id}"
+        )
+
+        if not layout:
+            logger.error(f"Failed to fetch layout for VOD/event content_id: {content_id}")
+            return []
+
+        return self.get_drm_for_content(layout, drm_variant=drm_variant)
+
+    def get_drm_for_content(self, layout_data: Dict, drm_variant: str = "auto") -> List[DRMConfig]:
+        """
+        Extract DRM configuration from layout data with DRM variant awareness.
+
+        Args:
+            layout_data: Layout response from Bedrock API
+            drm_variant: 'auto' (prefer hardware), 'software', or 'hardware'
+
+        Returns:
+            List of DRMConfig objects
+        """
+        if self.authenticator.has_user_credentials():
+            if not self.authenticator.ensure_profile_selected():
+                logger.warning("Failed to select profile for DRM request")
+
+        assets = self.extract_video_assets(layout_data)
+
+        if not assets:
+            return []
+
+        def asset_priority(asset: Dict) -> int:
+            drm_type = asset.get("drm", {}).get("type", "")
+
+            if drm_variant == "software":
+                if drm_type != "software":
+                    return -1
+                priority = 1000
+            elif drm_variant == "hardware":
+                if drm_type != "hardware":
+                    return -1
+                priority = 1000
+            else:  # "auto"
+                if drm_type == "hardware":
+                    priority = 1000
+                elif drm_type == "software":
+                    priority = 500
+                else:
+                    priority = 0
+
+            # Prefer dashcenc format and HD quality within the DRM tier
+            if asset.get("format") == "dashcenc":
+                priority += 10
+            if asset.get("quality") == "hd":
+                priority += 5
+
+            return priority
+
+        target_asset = None
+        best_priority = -1
+        for asset in assets:
+            p = asset_priority(asset)
+            if p > best_priority:
+                best_priority = p
+                target_asset = asset
+
+        if not target_asset:
+            logger.warning(f"No suitable DRM asset found for drm_variant='{drm_variant}'")
+            return []
+
+        drm_info = target_asset.get("drm", {})
+        drm_config = drm_info.get("config", {})
+        content_id = drm_config.get("contentId")
+
+        if not content_id:
+            logger.error("No contentId in asset DRM config")
+            return []
+
+        try:
+            uid = self.authenticator.get_user_id_from_token()
+            if not uid:
+                logger.error("No user ID available for DRM")
+                return []
+
+            upfront_token = self.authenticator.get_upfront_token(
+                content_id=content_id,
+                uid=uid,
+            )
+
+            if not upfront_token:
+                logger.error(f"Failed to get upfront token for {content_id}")
+                return []
+
+            drm_configs = create_drmtoday_configs(
+                upfront_token=upfront_token,
+                origin=self.rtl_config.base_website.rstrip("/"),
+                referer=self.rtl_config.base_website,
+                user_agent=self.rtl_config.user_agent,
+                playready_user_agent=RTLPlusDefaults.PLAYREADY_USER_AGENT,
+            )
+
+            logger.debug(
+                f"DRM config created for content_id={content_id}, "
+                f"asset_format={target_asset.get('format')}, "
+                f"drm_type={target_asset.get('drm', {}).get('type')}, "
+                f"drm_variant={drm_variant}"
+            )
+
+            return drm_configs
+
+        except Exception as e:
+            logger.error(f"Failed to get DRM: {e}")
+            return []
+
+    def get_user_bearer_token(self) -> Optional[str]:
+        """Get a user-authenticated bearer token, upgrading if necessary. Returns None if impossible."""
+        from ...base.auth.base_auth import TokenAuthLevel
+
+        current_level = self.authenticator.get_current_token_level()
+
+        if current_level == TokenAuthLevel.USER_AUTHENTICATED:
+            self.authenticator.ensure_profile_selected()
+            return self.authenticator.get_bearer_token()
+
+        if self.authenticator.has_user_credentials():
+            token = self.authenticator.get_bearer_token(force_upgrade=True)
+            if self.authenticator.get_current_token_level() == TokenAuthLevel.USER_AUTHENTICATED:
+                self.authenticator.ensure_profile_selected()
+                return token
+
+        return None

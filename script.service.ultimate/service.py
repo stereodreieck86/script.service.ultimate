@@ -1,0 +1,2841 @@
+#!/usr/bin/env python3
+import hashlib
+import json
+import math
+import os
+import signal
+import sys
+import threading
+import time
+from socketserver import ThreadingMixIn
+from urllib.parse import parse_qsl, quote, urlencode
+from typing import Optional
+from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
+import requests
+
+from bottle import Bottle, ServerAdapter, redirect, request, response, run
+
+# Add lib path for imports
+script_dir = os.path.dirname(os.path.abspath(__file__))
+LIB_PATH = os.path.join(script_dir, "lib")
+if os.path.exists(LIB_PATH):
+    sys.path.insert(0, LIB_PATH)
+
+try:
+    from streaming_providers import get_configured_manager
+
+    # Add EPG Manager import
+    from streaming_providers.base.epg.epg_manager import EPGManager
+    from streaming_providers.base.models import StreamingChannel
+    from streaming_providers.base.stream_format import (
+        StreamFormat,
+        content_type_for,
+        detect_format,
+    )
+    from streaming_providers.base.settings.provider_enable_manager import (
+        ProviderEnableManager,
+    )
+    from streaming_providers.base.utils import MPDCacheManager, MPDRewriter, logger
+    from streaming_providers.base.utils.hls_rewriter import (
+        HLSResource,
+        hls_cache_ttl,
+        rewrite_hls_playlist,
+    )
+    from streaming_providers.base.utils.init_kid_resolver import get_init_kid_resolver
+    from streaming_providers.base.utils.proxy_url import make_media_proxy_url_builder
+    from streaming_providers.base.utils.single_flight import SingleFlight
+    from streaming_providers.base.utils.environment import (
+        get_environment_manager,
+        get_vfs_instance,
+        is_kodi_environment,
+    )
+    from analytics.emitter import configure_from_env, shutdown_emitter
+except ImportError as import_err:
+    print(
+        f"Ultimate Backend: Critical import failed - {str(import_err)}", file=sys.stderr
+    )
+    raise
+
+
+# --- per-request stage timing (Server-Timing header + log line) --------------------------
+_SERVER_TIMING = os.environ.get("SERVER_TIMING", "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+class _stage:
+    """Context manager: records elapsed ms of a named stage on the current request.
+    Best-effort and exception-safe: outside a request it silently does nothing."""
+
+    def __init__(self, name: str):
+        self.name = name
+
+    def __enter__(self):
+        self._t0 = time.perf_counter()
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            request.environ.setdefault("ultimate.timing", []).append(
+                (self.name, (time.perf_counter() - self._t0) * 1000.0)
+            )
+        except Exception:
+            pass
+        return False
+
+
+def _stage_mark(name: str) -> None:
+    try:
+        request.environ.setdefault("ultimate.timing", []).append((name, 0.0))
+    except Exception:
+        pass
+
+
+class _ManifestUnavailable(Exception):
+    """Provider returned no manifest URL (maps to HTTP 404, not a transient failure)."""
+
+
+def _manifest_content_type(content: Optional[str]) -> str:
+    """Content-Type for a manifest body, from the content itself (the source
+    of truth, same rule as detect_format). Unknown falls back to DASH, which is
+    what every manifest route served before HLS existed."""
+    # Cached manifests may come back as bytes, and a content type must never be
+    # the reason a manifest request fails: anything undecodable stays DASH.
+    if isinstance(content, (bytes, bytearray)):
+        content = bytes(content[:8192]).decode("utf-8", errors="ignore")
+    if not isinstance(content, str):
+        return content_type_for(None)
+    return content_type_for(detect_format(content))
+
+
+def _require_dash(manifest_text: str, label: str) -> None:
+    """The DASH rewrite paths must never be fed an HLS playlist: MPDRewriter
+    would fail with an opaque XML parse error. HLS goes through
+    UltimateService.get_proxied_hls_playlist."""
+    if detect_format(manifest_text) is StreamFormat.HLS:
+        raise ValueError(
+            f"{label}: upstream returned an HLS playlist on the DASH rewrite path"
+        )
+
+
+class UltimateService:
+    def __init__(self, config_dir: str = None):
+        self.app = Bottle()
+
+        # Get environment manager
+        self.env_manager = get_environment_manager()
+
+        # Override config directory if provided
+        if config_dir:
+            self.env_manager.set_config("profile_path", config_dir)
+
+        # Get settings
+        self.server_port = self.env_manager.get_config("server_port", 7777)
+        self.default_country = self.env_manager.get_config("default_country", "DE")
+
+        # Initialize manager
+        try:
+            self.manager = get_configured_manager()
+            logger.info("Manager initialized successfully")
+        except Exception as init_err:
+            logger.error(f"Failed to initialize manager - {str(init_err)}")
+            raise
+
+        # Get media proxy URL from environment variable
+        self.media_proxy_url = os.environ.get("MEDIA_PROXY_URL", "").strip()
+        if not self.media_proxy_url:
+            logger.warning(
+                "MEDIA_PROXY_URL environment variable not set - media proxy features disabled"
+            )
+        else:
+            logger.info(f"Media proxy URL: {self.media_proxy_url}")
+
+        # MPEG-TS proxy (mpegts-proxy.py): optional HLS/DASH -> TS converter for
+        # clients that only understand TS. TS_PROXY_URL is the base URL CLIENTS
+        # use to reach it (e.g. http://nas:8000) — it ends up in playlists and
+        # in the Location of the .../stream/index.ts redirect. How the proxy
+        # reaches THIS backend is the proxy's own setting (MPEGTS_BACKEND_URL),
+        # so nothing about it lives here. Same opt-in pattern as
+        # MEDIA_PROXY_URL: the routes stay registered and answer 503 when
+        # unset, so the API surface is stable.
+        self.ts_proxy_url = os.environ.get("TS_PROXY_URL", "").strip().rstrip("/")
+        if not self.ts_proxy_url:
+            logger.info(
+                "TS_PROXY_URL environment variable not set - TS playlist and index.ts endpoints disabled"
+            )
+        else:
+            logger.info(f"TS proxy URL: {self.ts_proxy_url}")
+
+        # Per-instance timestamp backing _warn_clearkey_skip_throttled
+        # (interval: _CLEARKEY_SKIP_WARN_INTERVAL_SECONDS). Instance state,
+        # deliberately NOT a class attribute: a class-level timestamp would
+        # let one instance suppress another's warning wherever multiple
+        # service instances share a process (Kodi mode, tests). A fresh
+        # instance starts at 0.0, so its first ClearKey skip always warns.
+        self._last_clearkey_skip_warning = 0.0
+
+        # Initialize VFS for M3U caching
+        self.vfs = get_vfs_instance(subdir="m3u_cache")
+        logger.info(f"VFS initialized for M3U caching: {self.vfs.base_path}")
+
+        # Analytics: optional, best-effort, disabled unless ANALYTICS_ENDPOINT_URL
+        # is set. configure_from_env() never raises.
+        configure_from_env()
+
+        self.mpd_cache = MPDCacheManager()
+        logger.info(f"MPD cache initialized: {self.mpd_cache.vfs.base_path}")
+
+        self._decrypted_cache = {}  # key -> (content, expiry_ts) — memory-only, never persisted
+        # Rewritten HLS playlists: memory-only like the decrypted cache (they carry
+        # baked-in segment headers and session tokens, so never persisted).
+        self._hls_cache = {}  # sha256 key -> (content, expiry_ts)
+        self._hls_cache_lock = threading.Lock()
+        self._hls_flight = SingleFlight()
+        self._dash_flight = SingleFlight()  # concurrent identical DASH cold requests share one resolve+fetch+rewrite
+
+        # 1. Determine EPG URL FIRST (with proper precedence)
+        self.epg_url = self._determine_epg_url()
+        logger.info(f"UltimateService: Final EPG URL determined: {self.epg_url}")
+
+        # 2. Initialize EPG Manager WITH the URL
+        try:
+            self.epg_manager = EPGManager(self.epg_url)  # Pass the URL here
+            logger.info(f"EPG Manager initialized with URL: {self.epg_url}")
+        except ImportError as e:
+            logger.warning(f"Could not import EPG Manager: {e}")
+            self.epg_manager = None
+        except Exception as e:
+            logger.warning(f"Could not initialize EPG Manager: {e}")
+            self.epg_manager = None
+
+        # 3. Fetch EPG aliases for tvg-epgid mapping (initialize first)
+        self.epg_alias_map = {}  # Initialize to empty dict as fallback
+        self._fetch_epg_aliases()  # This will update self.epg_alias_map
+
+        self.setup_routes()
+        self.config_html = self._load_config_html()
+
+    def _determine_epg_url(self) -> str:
+        """
+        Determine EPG URL with proper precedence.
+        Must match the precedence logic in EPGManager.
+        """
+        import os
+
+        # 1. Environment variable (highest priority for Docker)
+        env_url = os.environ.get("ULTIMATE_EPG_URL")
+        if env_url and env_url.strip() and env_url != "https://example.com/epg.xml.gz":
+            logger.info(
+                f"UltimateService: Using EPG URL from environment variable: {env_url}"
+            )
+            return env_url.strip()
+
+        # 2. Try config.json via environment manager
+        try:
+            config_url = self.env_manager.get_config("epg_url")
+            if (
+                config_url
+                and config_url.strip()
+                and config_url != "https://example.com/epg.xml.gz"
+            ):
+                logger.info(
+                    f"UltimateService: Using EPG URL from config.json: {config_url}"
+                )
+                return config_url.strip()
+        except Exception as e:
+            logger.debug(
+                f"UltimateService: Could not get EPG URL from environment manager: {e}"
+            )
+
+        # 3. Try Kodi addon setting
+        try:
+            if is_kodi_environment():
+                import xbmcaddon
+
+                addon = xbmcaddon.Addon()
+                kodi_url = addon.getSetting("epg_xml_url")
+                if (
+                    kodi_url
+                    and kodi_url.strip()
+                    and kodi_url != "https://example.com/epg.xml.gz"
+                ):
+                    logger.info(
+                        f"UltimateService: Using EPG URL from Kodi settings: {kodi_url}"
+                    )
+                    return kodi_url.strip()
+        except Exception as e:
+            logger.debug(
+                f"UltimateService: Could not get EPG URL from Kodi settings: {e}"
+            )
+
+        # 4. Default fallback
+        default_url = "https://example.com/epg.xml.gz"
+        logger.warning(
+            f"UltimateService: No valid EPG URL found, using default: {default_url}"
+        )
+        logger.warning("Please set ULTIMATE_EPG_URL environment variable!")
+        return default_url
+
+    def _load_config_html(self):
+        """Load the web interface HTML template with embedded CSS and JS"""
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        web_dir = os.path.join(base_dir, "resources", "web")
+
+        # Define file paths
+        html_path = os.path.join(web_dir, "config.html")
+        css_path = os.path.join(web_dir, "config.css")
+        js_path = os.path.join(web_dir, "config.js")
+
+        # Proxy files
+        proxy_css_path = os.path.join(web_dir, "proxy.css")
+        proxy_js_path = os.path.join(web_dir, "proxy.js")
+
+        # EPG mapping files
+        epg_css_path = os.path.join(web_dir, "epg_mapping.css")
+        epg_js_path = os.path.join(web_dir, "epg_mapping.js")
+        fuzzyset_path = os.path.join(web_dir, "lib", "fuzzyset.js")
+        debounce_path = os.path.join(web_dir, "lib", "debounce.js")
+
+        # Enable/disable files
+        enable_css_path = os.path.join(web_dir, "provider_enable.css")
+        enable_js_path = os.path.join(web_dir, "provider_enable.js")
+
+        try:
+            # Load HTML
+            with open(html_path, "r", encoding="utf-8") as f:
+                html = f.read()
+
+            # Load CSS files
+            with open(css_path, "r", encoding="utf-8") as f:
+                css = f.read()
+
+            with open(proxy_css_path, "r", encoding="utf-8") as f:
+                proxy_css = f.read()
+
+            with open(epg_css_path, "r", encoding="utf-8") as f:
+                epg_css = f.read()
+
+            with open(enable_css_path, "r", encoding="utf-8") as f:
+                enable_css = f.read()
+
+            # Load JS files
+            with open(js_path, "r", encoding="utf-8") as f:
+                js = f.read()
+
+            with open(proxy_js_path, "r", encoding="utf-8") as f:
+                proxy_js = f.read()
+
+            with open(epg_js_path, "r", encoding="utf-8") as f:
+                epg_js = f.read()
+
+            with open(fuzzyset_path, "r", encoding="utf-8") as f:
+                fuzzyset_js = f.read()
+
+            with open(debounce_path, "r", encoding="utf-8") as f:
+                debounce_js = f.read()
+
+            with open(enable_js_path, "r", encoding="utf-8") as f:
+                enable_js = f.read()
+
+            # Combine all CSS (correct order: base -> proxy -> epg -> enable)
+            combined_css = f"{css}\n\n/* Proxy CSS */\n{proxy_css}\n\n/* EPG Mapping CSS */\n{epg_css}\n\n/* Provider Enable/Disable CSS */\n{enable_css}"
+
+            # Combine all JS (with proper order)
+            combined_js = f"""
+            /* Debounce Utility */
+            {debounce_js}
+
+            /* FuzzySet Library */
+            {fuzzyset_js}
+
+            /* Main Config JS */
+            {js}
+
+            /* Proxy Management JS */
+            {proxy_js}
+
+            /* EPG Mapping JS */
+            {epg_js}
+
+            /* Provider Enable/Disable JS */
+            {enable_js}
+            """
+
+            # Replace CSS in HTML
+            html = html.replace(
+                '<link rel="stylesheet" href="config.css">',
+                f"<style>\n{combined_css}\n</style>",
+            )
+
+            # Inject JavaScript before </body> tag
+            script_tag = f"<script>\n{combined_js}\n</script>"
+
+            if '<script src="config.js"></script>' in html:
+                html = html.replace('<script src="config.js"></script>', script_tag)
+            else:
+                html = html.replace("</body>", f"{script_tag}\n</body>")
+
+            return html
+
+        except Exception as e:
+            logger.error(f"Failed to load config files: {e}")
+            return self._get_fallback_html()
+
+    @staticmethod
+    def _get_fallback_html():
+        """Generate a minimal fallback HTML if file is not found"""
+        return """
+         <!DOCTYPE html>
+         <html>
+         <head>
+             <title>Ultimate Backend Config - Fallback</title>
+             <style>
+                 body { font-family: Arial, sans-serif; padding: 20px; }
+                 .error { color: red; }
+             </style>
+         </head>
+         <body>
+             <h1>Configuration Interface</h1>
+             <p class="error">Warning: Full interface not loaded. Using basic mode.</p>
+             <p><a href="/api/providers">View Providers</a></p>
+             <div id="providers-container"></div>
+             <script>
+                 async function loadProviders() {
+                     const response = await fetch('/api/providers');
+                     const data = await response.json();
+
+                     let html = '<h2>Providers</h2>';
+                     data.providers.forEach(provider => {
+                         html += `
+                         <div style="border:1px solid #ccc; padding:10px; margin:10px 0;">
+                             <h3>${provider.label}</h3>
+                             <input id="user-${provider.name}" placeholder="Username">
+                             <input id="pass-${provider.name}" type="password" placeholder="Password">
+                             <button onclick="save('${provider.name}')">Save</button>
+                         </div>`;
+                     });
+                     document.getElementById('providers-container').innerHTML = html;
+                 }
+
+                 async function save(provider) {
+                     const creds = {
+                         username: document.getElementById('user-' + provider).value,
+                         password: document.getElementById('pass-' + provider).value
+                     };
+
+                     await fetch(`/api/providers/${provider}/credentials`, {
+                         method: 'POST',
+                         headers: {'Content-Type': 'application/json'},
+                         body: JSON.stringify(creds)
+                     });
+
+                     alert('Saved');
+                 }
+
+                 loadProviders();
+             </script>
+         </body>
+         </html>
+         """
+
+    def _get_setting(self, setting_id: str, default: str = None) -> str:
+        """Get setting value from appropriate source"""
+        # Try Kodi settings first if in Kodi environment
+        if is_kodi_environment():
+            try:
+                import xbmcaddon
+
+                addon = xbmcaddon.Addon()
+                value = addon.getSetting(setting_id)
+                return value if value else default
+            except Exception as e:
+                logger.debug(f"Could not get Kodi setting {setting_id}: {e}")
+
+        # Fallback to environment manager config
+        return self.env_manager.get_config(setting_id, default)
+
+    def fetch_manifest_for_rewriter(
+            self,
+            provider: str,
+            channel_id: str,
+            manifest_url: str,
+            header_kwargs: Optional[dict] = None,
+    ) -> tuple:
+        """
+        Fetch a manifest and collect everything MPDRewriter needs.
+
+        header_kwargs (country, start_time, end_time, epg_id, ...) are passed to the
+        provider's get_manifest_headers / get_segment_headers, as the route layer's
+        _build_stream_headers does. None keeps the historical behaviour (channel id only).
+
+        Returns:
+            (manifest_text, ttl, provider_proxy_url, segment_headers, effective_manifest_url)
+            effective_manifest_url is the post-redirect URL (may differ from manifest_url
+            if the CDN issues a 302). Always use this for MPD rewriting so that relative
+            segment paths are resolved against the correct base.
+
+        Raises:
+            ValueError: if the provider HTTP manager is not available
+            requests.HTTPError: if the manifest fetch fails
+        """
+        http_manager = self.manager.get_provider_http_manager(provider)
+        if not http_manager:
+            raise ValueError(f'Provider "{provider}" not configured properly (no HTTP manager)')
+
+        # Resolve manifest headers from the provider so auth tokens etc. are sent
+        provider_instance = self.manager.get_provider(provider)
+        header_kwargs = header_kwargs or {}
+        with _stage("headers"):
+            manifest_headers = (
+                provider_instance.get_manifest_headers(channel_id, **header_kwargs)
+                if provider_instance else {}
+            )
+            segment_headers = (
+                provider_instance.get_segment_headers(channel_id, **header_kwargs)
+                if provider_instance else {}
+            )
+
+        with _stage("upstream"):
+            manifest_response = http_manager.get(
+                manifest_url, headers=manifest_headers, operation="manifest"
+            )
+            manifest_response.raise_for_status()
+
+        # Cache TTL: prefer HTTP Cache-Control/Expires, fall back to MPD minimumUpdatePeriod
+        ttl = MPDRewriter.extract_cache_ttl(manifest_response.headers)
+        mpd_ttl = MPDRewriter.extract_mpd_update_period(manifest_response.text)
+        if mpd_ttl and mpd_ttl < ttl:
+            ttl = mpd_ttl
+
+        # Derive provider-side proxy URL for the media proxy to use when forwarding
+        provider_proxy_url = None
+        if http_manager.config.proxy_config:
+            proxy_cfg = http_manager.config.proxy_config
+            provider_proxy_url = (
+                f"{proxy_cfg.proxy_type.value.lower()}://{proxy_cfg.host}:{proxy_cfg.port}"
+            )
+
+        return manifest_response.text, ttl, provider_proxy_url, segment_headers, manifest_response.url
+
+    def _make_kid_resolver(self, provider: str, segment_headers: Optional[dict]):
+        """
+        Build the init-URL -> KID callable for MPDRewriter (tenc lookup when the
+        MPD carries no KID in multi-key mode). The resolver and its cache are
+        process-wide; headers and HTTP manager are bound per provider here.
+        """
+        resolver = get_init_kid_resolver()
+        http_manager = self.manager.get_provider_http_manager(provider)
+        return lambda init_url: resolver.resolve(
+            init_url, headers=segment_headers, http_manager=http_manager
+        )
+
+    def _get_decrypted_cached(self, key: str, max_stale: int = 0) -> Optional[str]:
+        entry = self._decrypted_cache.get(key)
+        if not entry:
+            return None
+        content, expiry = entry
+        now = time.time()
+        if now < expiry:
+            return content
+        if max_stale and (now - expiry) <= max_stale:
+            logger.warning(f"Serving STALE decrypted manifest for {key} ({now - expiry:.1f}s past expiry)")
+            return content
+        self._decrypted_cache.pop(key, None)  # pop, not del: concurrent readers may both see it expired
+        return None
+
+    _DECRYPTED_CACHE_PRUNE_ABOVE = 64   # entries; pruning starts above this
+    _DECRYPTED_STALE_KEEP = 30          # seconds an expired entry is kept for the stale fallback
+
+    def _set_decrypted_cached(self, key: str, content: str, ttl: int) -> None:
+        now = time.time()
+        self._decrypted_cache[key] = (content, now + ttl)
+        # Entries hold ClearKey material and were only ever removed when the SAME key was read again
+        # (one-off catchup keys therefore stayed in memory forever): drop long-expired ones on write.
+        if len(self._decrypted_cache) > self._DECRYPTED_CACHE_PRUNE_ABOVE:
+            for k, (_, expiry) in list(self._decrypted_cache.items()):
+                if expiry < now - self._DECRYPTED_STALE_KEEP:
+                    self._decrypted_cache.pop(k, None)
+
+    @staticmethod
+    def _fetch_and_cache_manifest(fetch_fn, cache_set, cache_get_stale, *,
+                                   cacheable: bool, stale_window: int, label: str) -> str:
+        """
+        Shared fetch -> rewrite -> cache -> stale-fallback flow.
+
+        fetch_fn()          -> (content: str, ttl: int), raises on failure
+        cache_set(content, ttl) -> None
+        cache_get_stale(max_stale) -> Optional[str]
+
+        Caller is responsible for the upfront "is it already cached" check and
+        manifest_url/config validation before calling this — that keeps a warm
+        cache hit from paying for a manifest_url lookup it doesn't need.
+        """
+        try:
+            content, ttl = fetch_fn()
+            if cacheable:
+                cache_set(content, ttl)
+            response.content_type = _manifest_content_type(content)
+            return content
+        except _ManifestUnavailable as e:
+            response.status = 404
+            response.content_type = "application/json"
+            return json.dumps({"error": str(e)})
+        except ValueError as e:
+            # Config error (e.g. no HTTP manager) — not transient, don't mask with stale cache
+            logger.error(str(e))
+            response.status = 502
+            response.content_type = "application/json"
+            return json.dumps({"error": str(e)})
+        except Exception as fetch_err:
+            logger.warning(f"{label} fetch failed: {fetch_err} — checking stale cache")
+            if cacheable:
+                stale = cache_get_stale(stale_window)
+                if stale:
+                    logger.warning(f"Serving stale {label} due to fetch failure")
+                    response.content_type = _manifest_content_type(stale)
+                    return stale
+            logger.error(f"Failed to fetch {label}: {fetch_err}")
+            response.status = 502
+            response.content_type = "application/json"
+            return json.dumps({"error": f"Failed to fetch manifest: {str(fetch_err)}"})
+
+    def _dash_produce(self, flight_key: str, fetch_fn, cache_set, cache_peek):
+        """Single-flight resolve -> fetch -> rewrite -> cache for DASH manifests.
+
+        Concurrent identical cold requests (several clients, or Kodi's parallel manifest/stream
+        calls) share ONE provider URL resolution, ONE upstream fetch and ONE rewrite. The leader
+        stores the result; followers get the same (content, ttl). Mirrors the HLS path."""
+        def produce():
+            hit = cache_peek()  # a previous flight may have finished between our cache check and becoming leader
+            if hit:
+                return hit, 0
+            content, ttl = fetch_fn()
+            cache_set(content, ttl)
+            return content, ttl
+
+        with _stage("flight"):
+            return self._dash_flight.do(flight_key, produce)
+
+    def get_proxied_manifest(self, provider: str, channel_id: str, highest_quality_only: bool = False) -> str:
+        country = request.query.get("country")
+        # The rewritten manifest differs per quality mode, so each mode has its own cache entry
+        # (highest_quality_only used to bypass the cache and pay the full cold path on every request).
+        cache_id = f"{channel_id}_hq" if highest_quality_only else channel_id
+
+        cached_mpd = self.mpd_cache.get(provider, cache_id)
+        if cached_mpd:
+            _stage_mark("cache_hit")
+            response.content_type = _manifest_content_type(cached_mpd)
+            return cached_mpd
+
+        if not self.media_proxy_url:
+            response.status = 503
+            response.content_type = "application/json"
+            return json.dumps({"error": "Media proxy not configured (MEDIA_PROXY_URL not set)"})
+
+        box = {}
+
+        def fetch_fn():
+            with _stage("resolve_url"):
+                try:
+                    manifest_url = self.manager.get_channel_manifest(
+                        provider_name=provider, channel_id=channel_id, country=country
+                    )
+                except ValueError as e:  # e.g. provider not found/disabled: 404, as before this was moved into the flight
+                    raise _ManifestUnavailable(str(e))
+            if not manifest_url:
+                raise _ManifestUnavailable(
+                    f'Manifest not available for channel "{channel_id}" from provider "{provider}"')
+            box["url"] = manifest_url
+            manifest_text, ttl, provider_proxy_url, segment_headers, effective_url = self.fetch_manifest_for_rewriter(
+                provider, channel_id, manifest_url
+            )
+            _require_dash(manifest_text, f"{provider}/{channel_id}")
+            rewriter = MPDRewriter(
+                self.media_proxy_url, provider_proxy_url, None, highest_quality_only,
+                provider=provider, channel=channel_id, segment_headers=segment_headers,
+            )
+            with _stage("rewrite"):
+                return rewriter.rewrite_mpd(manifest_text, effective_url), ttl
+
+        return self._fetch_and_cache_manifest(
+            lambda: self._dash_produce(
+                f"dash:{provider}:{cache_id}", fetch_fn,
+                cache_set=lambda content, ttl: self.mpd_cache.set(
+                    provider=provider, channel_id=cache_id, mpd_content=content, ttl=ttl,
+                    original_url=box.get("url")),
+                cache_peek=lambda: self.mpd_cache.get(provider, cache_id),
+            ),
+            cache_set=lambda content, ttl: None,  # stored once per flight by _dash_produce
+            cache_get_stale=lambda max_stale: self.mpd_cache.get(provider, cache_id, max_stale=max_stale),
+            cacheable=True,
+            stale_window=15,
+            label=f"manifest for {provider}/{channel_id}",
+        )
+
+    def get_proxied_catchup_manifest(self, provider: str, channel_id: str, start_time: int, end_time: int,
+                                      epg_id: str = None, country: str = None) -> str:
+        cache_key = f"{channel_id}_catchup_{start_time}_{end_time}"
+
+        cached_mpd = self.mpd_cache.get(provider, cache_key)
+        if cached_mpd:
+            _stage_mark("cache_hit")
+            response.content_type = _manifest_content_type(cached_mpd)
+            return cached_mpd
+
+        logger.info(f"Cache miss for catchup {provider}/{channel_id}, fetching manifest")
+
+        if not self.media_proxy_url:
+            response.status = 503
+            response.content_type = "application/json"
+            return json.dumps({"error": "Media proxy not configured (MEDIA_PROXY_URL not set)"})
+
+        box = {}
+
+        def fetch_fn():
+            with _stage("resolve_url"):
+                try:
+                    manifest_url = self.manager.get_catchup_manifest(
+                        provider_name=provider, channel_id=channel_id, start_time=start_time, end_time=end_time,
+                        epg_id=epg_id, country=country,
+                    )
+                except ValueError as e:  # e.g. provider not found/disabled: 404, as before this was moved into the flight
+                    raise _ManifestUnavailable(str(e))
+            if not manifest_url:
+                raise _ManifestUnavailable("Catchup manifest not available")
+            box["url"] = manifest_url
+            manifest_text, ttl, provider_proxy_url, segment_headers, effective_url = self.fetch_manifest_for_rewriter(
+                provider, channel_id, manifest_url
+            )
+            _require_dash(manifest_text, f"{provider}/{channel_id} (catchup)")
+            rewriter = MPDRewriter(
+                self.media_proxy_url, provider_proxy_url, None, False,
+                provider=provider, channel=channel_id, segment_headers=segment_headers,
+            )
+            with _stage("rewrite"):
+                return rewriter.rewrite_mpd(manifest_text, effective_url), ttl
+
+        return self._fetch_and_cache_manifest(
+            lambda: self._dash_produce(
+                f"dash:{provider}:{cache_key}", fetch_fn,
+                cache_set=lambda content, ttl: self.mpd_cache.set(
+                    provider=provider, channel_id=cache_key, mpd_content=content, ttl=ttl,
+                    original_url=box.get("url")),
+                cache_peek=lambda: self.mpd_cache.get(provider, cache_key),
+            ),
+            cache_set=lambda content, ttl: None,
+            cache_get_stale=lambda max_stale: self.mpd_cache.get(provider, cache_key, max_stale=max_stale),
+            cacheable=True,
+            stale_window=15,
+            label=f"catchup manifest for {provider}/{channel_id}",
+        )
+
+    # ------------------------------------------------------------------
+    # HLS playlists through the media proxy (phase 2, Option A)
+    #
+    # The backend fetches, rewrites and serves EVERY playlist; the media proxy
+    # only carries segments / init segments / (later) keys. Cache is memory-only
+    # and keyed by a hash of everything the output depends on.
+    # ------------------------------------------------------------------
+    _HLS_CACHE_MAX_ENTRIES = 256
+    _HLS_STALE_KEEP = 30  # seconds an expired entry stays for the stale fallback
+
+    @staticmethod
+    def _hls_cache_key(provider: str, content_id: str, upstream_url: str,
+                       header_kwargs: Optional[dict], cache_scope: str, proxy_keys: bool) -> str:
+        """Hash, so session tokens inside upstream URLs never show up in logs."""
+        raw = json.dumps(
+            [provider, content_id, upstream_url, sorted((header_kwargs or {}).items()),
+             cache_scope, bool(proxy_keys)],
+            default=str,
+        )
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    def _get_hls_cached(self, key: str, max_stale: float = 0) -> Optional[str]:
+        entry = self._hls_cache.get(key)
+        if not entry:
+            return None
+        content, expiry = entry
+        overdue = time.time() - expiry
+        if overdue < 0:
+            return content
+        if max_stale and overdue <= max_stale:
+            logger.warning(f"Serving STALE HLS playlist ({overdue:.1f}s past expiry)")
+            return content
+        # Expired entries are NOT deleted here (unlike _get_decrypted_cached): the
+        # stale fallback runs after this lookup and still needs them. _set prunes.
+        return None
+
+    def _set_hls_cached(self, key: str, content: str, ttl: float) -> None:
+        now = time.time()
+        with self._hls_cache_lock:
+            self._hls_cache[key] = (content, now + ttl)
+            if len(self._hls_cache) <= self._HLS_CACHE_MAX_ENTRIES:
+                return
+            for k, (_, expiry) in list(self._hls_cache.items()):
+                if expiry < now - self._HLS_STALE_KEEP:
+                    del self._hls_cache[k]
+            overflow = len(self._hls_cache) - self._HLS_CACHE_MAX_ENTRIES
+            if overflow > 0:
+                for k, _ in sorted(self._hls_cache.items(), key=lambda kv: kv[1][1])[:overflow]:
+                    del self._hls_cache[k]
+
+    def get_proxied_hls_playlist(
+            self,
+            provider: str,
+            content_id: str,
+            upstream_url: str,
+            *,
+            build_playlist_url,
+            cache_scope: str = "",
+            header_kwargs: Optional[dict] = None,
+            proxy_keys: bool = False,
+    ) -> str:
+        """
+        Fetch one upstream HLS playlist (master or media) through the provider's
+        HTTP manager and return it rewritten for the media proxy.
+
+        build_playlist_url(upstream_url) -> URL of the backend playlist endpoint for a
+            nested playlist (variant, audio/subtitle rendition, I-frame). Supplied by
+            the endpoint, which owns token signing and the request's base URL.
+        cache_scope: anything else the OUTPUT depends on that is not in the other
+            arguments — in practice the request's base URL, because the playlist URLs
+            built above embed it.
+        header_kwargs: provider header context (country, start_time, end_time, epg_id);
+            forwarded to get_manifest_headers/get_segment_headers and part of the cache key.
+        proxy_keys: also route AES-128 key URIs through the media proxy.
+
+        Segment/init/key URLs become media-proxy URLs carrying the provider's segment
+        headers and provider proxy, exactly like the DASH path. Concurrent identical
+        requests share one fetch + rewrite (single-flight); the result is cached for
+        a fraction of the target duration (see hls_cache_ttl). Errors follow
+        _fetch_and_cache_manifest: config/rewrite errors -> 502 JSON, transient fetch
+        errors -> short stale fallback, else 502.
+        """
+        if not self.media_proxy_url:
+            response.status = 503
+            response.content_type = "application/json"
+            return json.dumps({"error": "Media proxy not configured (MEDIA_PROXY_URL not set)"})
+
+        key = self._hls_cache_key(provider, content_id, upstream_url, header_kwargs, cache_scope, proxy_keys)
+        cached = self._get_hls_cached(key)
+        if cached:
+            response.content_type = _manifest_content_type(cached)
+            return cached
+
+        def produce():
+            # A previous flight may have finished between our cache check and becoming leader.
+            hit = self._get_hls_cached(key)
+            if hit:
+                return hit, 0
+            text, _http_ttl, provider_proxy_url, segment_headers, effective_url = self.fetch_manifest_for_rewriter(
+                provider, content_id, upstream_url, header_kwargs=header_kwargs
+            )
+            provider_instance = self.manager.get_provider(provider)
+            media_url = make_media_proxy_url_builder(
+                self.media_proxy_url,
+                provider_proxy_url=provider_proxy_url,
+                segment_headers=segment_headers,
+            )
+
+            def build_url(url: str, kind: HLSResource) -> str:
+                return build_playlist_url(url) if kind is HLSResource.PLAYLIST else media_url(url)
+
+            rewritten = rewrite_hls_playlist(
+                text, effective_url, build_url,
+                inherit_query=bool(getattr(provider_instance, "inherit_manifest_query_on_segments", True)),
+                proxy_keys=proxy_keys,
+            )
+            ttl = hls_cache_ttl(text)
+            self._set_hls_cached(key, rewritten, ttl)
+            return rewritten, ttl
+
+        return self._fetch_and_cache_manifest(
+            lambda: self._hls_flight.do(key, produce),
+            cache_set=lambda content, ttl: None,  # produce() already stored it, once per flight
+            cache_get_stale=lambda max_stale: self._get_hls_cached(key, max_stale),
+            cacheable=True,
+            stale_window=6,
+            label=f"HLS playlist for {provider}/{content_id}",
+        )
+
+    def get_decrypted_manifest(self, provider: str, channel_id: str, keyids: dict,
+                                highest_quality_only: bool = False, receiver_side: bool = False,
+                                drm_variant: str = "auto") -> str:
+        country = request.query.get("country")
+        # Everything that changes the rewritten output belongs in the key: receiver-side vs
+        # server-side differ in ContentProtection signalling AND in the /api/proxy vs /api/decrypt
+        # endpoints, so they must never share an entry (they did before); same for quality mode.
+        cache_key = (
+            f"{provider}_{channel_id}_drm_{drm_variant}_{'recv' if receiver_side else 'srv'}"
+            f"{'_hq' if highest_quality_only else ''}"
+        )
+
+        cached_mpd = self._get_decrypted_cached(cache_key)
+        if cached_mpd:
+            _stage_mark("cache_hit")
+            response.content_type = _manifest_content_type(cached_mpd)
+            return cached_mpd
+
+        if not self.media_proxy_url:
+            response.status = 503
+            response.content_type = "application/json"
+            return json.dumps({"error": "Media proxy not configured (MEDIA_PROXY_URL not set)"})
+
+        logger.info(
+            f"Generating {'receiver' if receiver_side else 'server'}-side clearkey manifest "
+            f"for {provider}/{channel_id} (highest_quality_only={highest_quality_only}, drm_variant={drm_variant})"
+        )
+
+        def fetch_fn():
+            with _stage("resolve_url"):
+                try:
+                    manifest_url = self.manager.get_channel_manifest(
+                        provider_name=provider, channel_id=channel_id, country=country, drm_variant=drm_variant,
+                    )
+                except ValueError as e:  # e.g. provider not found/disabled: 404, as before this was moved into the flight
+                    raise _ManifestUnavailable(str(e))
+            if not manifest_url:
+                raise _ManifestUnavailable(
+                    f'Manifest not available for channel "{channel_id}" from provider "{provider}"')
+            manifest_text, ttl, provider_proxy_url, segment_headers, effective_url = self.fetch_manifest_for_rewriter(
+                provider, channel_id, manifest_url
+            )
+            rewriter = MPDRewriter(
+                self.media_proxy_url, provider_proxy_url, keyids, highest_quality_only,
+                provider=provider, channel=channel_id, clearkey_receiver_side=receiver_side,
+                segment_headers=segment_headers,
+                kid_resolver=self._make_kid_resolver(provider, segment_headers),
+            )
+            with _stage("rewrite"):
+                rewritten_mpd = rewriter.rewrite_mpd(manifest_text, effective_url)
+            return rewritten_mpd, min(ttl, 10)  # holds key material — keep exposure window short
+
+        return self._fetch_and_cache_manifest(
+            lambda: self._dash_produce(
+                f"dash:{cache_key}", fetch_fn,
+                cache_set=lambda content, ttl: self._set_decrypted_cached(cache_key, content, ttl),
+                cache_peek=lambda: self._get_decrypted_cached(cache_key),
+            ),
+            cache_set=lambda content, ttl: None,
+            cache_get_stale=lambda max_stale: self._get_decrypted_cached(cache_key, max_stale=max_stale),
+            cacheable=True,
+            stale_window=5,
+            label=f"decrypted manifest for {provider}/{channel_id}",
+        )
+
+    def get_decrypted_catchup_manifest(self, provider: str, channel_id: str, start_time: int, end_time: int,
+                                        keyids: dict, epg_id: str = None,
+                                        highest_quality_only: bool = False,
+                                        receiver_side: bool = False) -> str:
+        country = request.query.get("country")
+        cache_key = (
+            f"{provider}_{channel_id}_catchup_{start_time}_{end_time}_drm_{'recv' if receiver_side else 'srv'}"
+            f"{'_hq' if highest_quality_only else ''}"
+        )
+
+        cached_mpd = self._get_decrypted_cached(cache_key)
+        if cached_mpd:
+            _stage_mark("cache_hit")
+            response.content_type = _manifest_content_type(cached_mpd)
+            return cached_mpd
+
+        if not self.media_proxy_url:
+            response.status = 503
+            response.content_type = "application/json"
+            return json.dumps({"error": "Media proxy not configured (MEDIA_PROXY_URL not set)"})
+
+        logger.info(
+            f"Generating {'receiver' if receiver_side else 'server'}-side clearkey catchup manifest "
+            f"for {provider}/{channel_id} "
+            f"(start={start_time} end={end_time} highest_quality_only={highest_quality_only})"
+        )
+
+        def fetch_fn():
+            with _stage("resolve_url"):
+                try:
+                    manifest_url = self.manager.get_catchup_manifest(
+                        provider_name=provider, channel_id=channel_id, start_time=start_time, end_time=end_time,
+                        epg_id=epg_id, country=country,
+                    )
+                except ValueError as e:  # e.g. provider not found/disabled: 404, as before this was moved into the flight
+                    raise _ManifestUnavailable(str(e))
+            if not manifest_url:
+                raise _ManifestUnavailable(
+                    f'Catchup manifest not available for channel "{channel_id}" from provider "{provider}"')
+            manifest_text, ttl, provider_proxy_url, segment_headers, effective_url = self.fetch_manifest_for_rewriter(
+                provider, channel_id, manifest_url
+            )
+            rewriter = MPDRewriter(
+                self.media_proxy_url, provider_proxy_url, keyids, highest_quality_only,
+                provider=provider, channel=channel_id, clearkey_receiver_side=receiver_side,
+                segment_headers=segment_headers,
+                kid_resolver=self._make_kid_resolver(provider, segment_headers),
+            )
+            with _stage("rewrite"):
+                rewritten_mpd = rewriter.rewrite_mpd(manifest_text, effective_url)
+            return rewritten_mpd, min(ttl, 30)
+
+        return self._fetch_and_cache_manifest(
+            lambda: self._dash_produce(
+                f"dash:{cache_key}", fetch_fn,
+                cache_set=lambda content, ttl: self._set_decrypted_cached(cache_key, content, ttl),
+                cache_peek=lambda: self._get_decrypted_cached(cache_key),
+            ),
+            cache_set=lambda content, ttl: None,
+            cache_get_stale=lambda max_stale: self._get_decrypted_cached(cache_key, max_stale=max_stale),
+            cacheable=True,
+            stale_window=10,
+            label=f"decrypted catchup manifest for {provider}/{channel_id}",
+        )
+
+    @staticmethod
+    def _sort_channels(channels):
+        """Sort channels by channel_number ascending; channels without a number come last."""
+        return sorted(
+            channels,
+            key=lambda ch: (ch.channel_number is None, ch.channel_number or 0)
+        )
+
+    def _fetch_epg_aliases(self) -> None:
+        """
+        Fetch EPG aliases from ultimate-epg service for tvg-epgid mapping.
+        Updates self.epg_alias_map with mapping of channel_id -> epg_id.
+        """
+        api_base_url = os.environ.get("ULTIMATE_EPG_API_URL", "").strip()
+
+        if not api_base_url:
+            logger.info("ULTIMATE_EPG_API_URL not set - tvg-epgid will not be added to M3U playlists")
+            self.epg_alias_map = {}
+            return
+
+        aliases_url = f"{api_base_url.rstrip('/')}/api/v1/aliases"
+
+        try:
+            resp = requests.get(aliases_url, timeout=10)
+            resp.raise_for_status()
+
+            data = resp.json()
+            aliases = data.get("aliases", [])
+
+            # Build mapping: alias -> channel_name
+            alias_map = {}
+            for alias_entry in aliases:
+                alias = alias_entry.get("alias")
+                channel_name = alias_entry.get("channel_name")
+                if alias and channel_name:
+                    alias_map[alias] = channel_name
+
+            self.epg_alias_map = alias_map
+            logger.info(f"Fetched {len(alias_map)} EPG aliases from {aliases_url}")
+
+        except requests.exceptions.RequestException as e:
+            logger.warning(f"Failed to fetch EPG aliases from {aliases_url}: {e}")
+            self.epg_alias_map = {}
+        except Exception as e:
+            logger.warning(f"Unexpected error fetching EPG aliases: {e}")
+            self.epg_alias_map = {}
+
+    def _get_epg_id(self, channel_id: str) -> Optional[str]:
+        """
+        Get EPG ID (channel_name) for a given channel_id from alias mapping.
+
+        Args:
+            channel_id: The channel's ID (alias from ultimate-epg)
+
+        Returns:
+            EPG ID string if found, None otherwise
+        """
+        if not self.epg_alias_map:
+            return None
+        return self.epg_alias_map.get(channel_id)
+
+    def _build_m3u_entry_header(
+            self,
+            provider_name,
+            channel,
+            *,
+            provider_label=None,
+            drm_directives=None,
+            include_catchup=True,
+            manifest_headers_encoded=None,
+            segment_headers_encoded=None,
+    ) -> str:
+        """
+        Build the #EXTINF (+ optional KODIPROP) block for one channel, without
+        the trailing stream URL / playback line — callers append that
+        themselves via _generate_m3u_entry or their own final line (e.g. the
+        ffmpeg-piped variant, which wraps the stream URL in a pipe command
+        instead of using it directly).
+
+        Single source of truth for the EXTINF/catchup-tag/chno construction
+        previously duplicated across _generate_m3u_channel_entry,
+        _generate_m3u_proxied_channel_entry, and inline reimplementations in
+        _generate_m3u_proxied_fast, _generate_m3u_proxied_ffmpeg_fast, and
+        _generate_m3u_proxied_filtered_content's unencrypted branch.
+
+        Args:
+            provider_label: Pass explicitly when the caller already resolved
+                             it once per provider (avoids a redundant
+                             get_provider() lookup per channel). Falls back to
+                             a fresh lookup, then provider_name, if omitted.
+            drm_directives: None = look up this channel's DRM configs
+                             dynamically and generate directives if any exist
+                             (the historical /stream/index.mpd behavior).
+                             "" = skip DRM directives entirely (known
+                             unencrypted content). Any other string = insert
+                             as-is (e.g. a fixed
+                             "#KODIPROP:inputstream=inputstream.adaptive\\n"
+                             for content already known to be ClearKey/proxied,
+                             avoiding a redundant DRM lookup the caller
+                             already did).
+            include_catchup: False suppresses catchup attributes on the
+                             EXTINF line even if the channel has a catchup
+                             window — used by the ffmpeg-piped variant, which
+                             is intentionally live-only (existing behavior,
+                             preserved rather than changed here).
+            manifest_headers_encoded / segment_headers_encoded:
+                             Already-encoded header strings (see
+                             _encode_kodiprop_headers); None/"" = nothing to
+                             emit. This builder never calls the provider.
+                             Headers are an inputstream.adaptive feature, so
+                             emitting them also emits a bare
+                             "#KODIPROP:inputstream=inputstream.adaptive" when
+                             the DRM directives didn't already include it.
+        """
+        channel_id = channel.channel_id
+        channel_name = channel.name
+        channel_logo = channel.logo_url or ""
+        chno = self._chno_attr(channel)
+
+        epg_id = self._get_epg_id(channel_id)
+        epg_id_attr = f' tvg-epgid="{epg_id}"' if epg_id else ""
+
+        if provider_label is None:
+            try:
+                provider_label = self.manager.get_provider(provider_name).provider_label
+            except (AttributeError, KeyError, ValueError):
+                provider_label = provider_name
+
+        entry_content = ""
+        catchup_window = getattr(channel, 'catchup_hours', 0) if include_catchup else 0
+        # getattr's default only applies when the attribute is absent — Channel
+        # always defines catchup_hours, and providers that don't populate it
+        # leave it as None. Normalise None to 0 so the comparison below is
+        # type-safe.
+        catchup_window = catchup_window or 0
+        if catchup_window > 0:
+            catchup_type = getattr(channel, 'catchup_type', 'append')
+            catchup_source = getattr(channel, 'catchup_source', '?start_time={utc}&end_time={utcend}')
+            catchup_days = math.ceil(catchup_window / 24)
+            entry_content += (
+                f'#EXTINF:-1 tvg-id="{channel_id}"{epg_id_attr}{chno} tvg-logo="{channel_logo}" '
+                f'group-title="{provider_label}" catchup="{catchup_type}" catchup-days="{catchup_days}" '
+                f'catchup-source="{catchup_source}",{channel_name}\n'
+            )
+        else:
+            entry_content += (
+                f'#EXTINF:-1 tvg-id="{channel_id}"{epg_id_attr}{chno} tvg-logo="{channel_logo}" '
+                f'group-title="{provider_label}",{channel_name}\n'
+            )
+
+        if drm_directives is None:
+            try:
+                drm_configs = self.manager.get_channel_drm_configs(
+                    provider_name=provider_name, channel_id=channel_id
+                )
+                if drm_configs:
+                    entry_content += self._generate_drm_directives(drm_configs)
+            except Exception as drm_err:
+                logger.debug(
+                    f"Could not get DRM for {provider_name}/{channel_id}: {str(drm_err)}"
+                )
+        elif drm_directives:
+            entry_content += drm_directives
+
+        if manifest_headers_encoded or segment_headers_encoded:
+            if "#KODIPROP:inputstream=inputstream.adaptive\n" not in entry_content:
+                entry_content += "#KODIPROP:inputstream=inputstream.adaptive\n"
+            if self._is_hls_hint(channel):
+                # inputstream.adaptive was activated above; don't leave the
+                # manifest type to autodetection when the hint says HLS.
+                entry_content += "#KODIPROP:inputstream.adaptive.manifest_type=hls\n"
+            if manifest_headers_encoded:
+                entry_content += (
+                    f"#KODIPROP:inputstream.adaptive.manifest_headers={manifest_headers_encoded}\n"
+                )
+            if segment_headers_encoded:
+                entry_content += (
+                    f"#KODIPROP:inputstream.adaptive.stream_headers={segment_headers_encoded}\n"
+                )
+
+        return entry_content
+
+    @staticmethod
+    def _is_hls_hint(channel) -> bool:
+        """True if the channel's streaming_format HINT says HLS. Only a hint:
+        unknown (None) means "no information", not DASH."""
+        return StreamFormat.parse(getattr(channel, "streaming_format", None)) is StreamFormat.HLS
+
+    @staticmethod
+    def stream_path_for(channel, stream_path: str) -> str:
+        """Point HLS-hinted channels at the index.m3u8 alias of the single
+        stream route; everything else keeps index.mpd. Query strings are
+        untouched. Same handler either way — the alias only helps clients that
+        choose their player from the URL extension."""
+        if UltimateService._is_hls_hint(channel):
+            return stream_path.replace("stream/index.mpd", "stream/index.m3u8", 1)
+        return stream_path
+
+    def _generate_m3u_entry(
+            self,
+            base_url,
+            provider_name,
+            channel,
+            *,
+            stream_path,
+            provider_label=None,
+            drm_directives=None,
+            include_catchup=True,
+    ) -> str:
+        """
+        Full M3U entry (header + trailing stream URL line) for one channel.
+        See _build_m3u_entry_header for the shared header-construction logic;
+        this just appends the stream URL built from stream_path.
+
+        Args:
+            base_url: Prefix for the stream URL. Pass "" to emit a RELATIVE
+                      URL (/api/providers/...) — the M3U cache is
+                      host-independent; routes/m3u.py absolutizes at the
+                      response boundary using the current request's base URL.
+            stream_path: Relative path (optionally with a query string) after
+                         .../channels/{channel_id}/. There's only one real
+                         channel stream route now — "stream/index.mpd" — so
+                         callers select behavior via query params on it, e.g.
+                         "stream/index.mpd?client_drm=true" or
+                         "stream/index.mpd?client_drm=false&highest_quality_only=true".
+                         This function doesn't parse or validate stream_path;
+                         it's appended as-is.
+        """
+        channel_id = channel.channel_id
+        stream_path = self.stream_path_for(channel, stream_path)
+        header = self._build_m3u_entry_header(
+            provider_name, channel,
+            provider_label=provider_label,
+            drm_directives=drm_directives,
+            include_catchup=include_catchup,
+        )
+        stream_url = f"/api/providers/{provider_name}/channels/{channel_id}/{stream_path}"
+        if base_url:
+            stream_url = f"{base_url}{stream_url}"
+        return header + f"{stream_url}\n"
+
+    def _iter_m3u_provider_channels(self, providers_to_process):
+        """
+        Yield (provider_name, provider_label, channels) for each provider in
+        providers_to_process — sorted channels, with provider_label resolved
+        (falling back to provider_name on lookup failure).
+
+        Extracted from the four _generate_m3u_* generators, which duplicated
+        this exact prefix. Structurally identical to what each of them did
+        inline: channels-fetch and provider_label lookup share one
+        try/except Exception (log-and-skip-this-provider), with the label
+        lookup nested inside on its own narrower
+        (AttributeError, KeyError, ValueError) fallback — same nesting as
+        before, just here once instead of four times. Each caller still
+        wraps its own per-channel body in its own try/except Exception,
+        log-and-continue-to-next-provider, exactly as it did before this
+        was split out — this generator doesn't change where or how
+        failures are caught, only removes the duplicated lookup code ahead
+        of that point.
+        """
+        for provider_name in providers_to_process:
+            try:
+                channels = self._sort_channels(
+                    self.manager.get_channels(provider_name=provider_name, fetch_manifests=False)
+                )
+                try:
+                    provider_instance = self.manager.get_provider(provider_name)
+                    provider_label = provider_instance.provider_label
+                except (AttributeError, KeyError, ValueError):
+                    provider_label = provider_name
+            except Exception as provider_err:
+                logger.warning(
+                    f"Failed to process provider '{provider_name}': {str(provider_err)}"
+                )
+                continue
+            yield provider_name, provider_label, channels
+
+    def _generate_m3u_plain_content(self, providers=None, save_to_cache=True, cache_filename=None):
+        """
+        Generate M3U content for the default, server-side-decrypt stream
+        route — bare "stream/index.mpd", no query string at all (client_drm
+        defaults to false at the route level in channels.py, so this is
+        equivalent to the old explicit "?client_drm=false", just without
+        writing out a param that only restates the default).
+
+        This is what "/api/m3u" and "/api/providers/<provider>/m3u" serve.
+        It replaces the old uncached "/m3u/proxied" fast-path — same DRM
+        handling (drm_directives="", nothing embedded, server does the
+        decrypting) — but adds caching back, because nothing on this path
+        is request-time-volatile: there's no per-channel DRM/key lookup
+        happening at generation time, unlike the dynamic-DRM "clientdrm"
+        variant below.
+
+        Stream URLs are emitted RELATIVE and cached that way. routes/m3u.py
+        absolutizes at the response boundary so a single cached playlist
+        serves every client (IP or hostname) correctly.
+
+        Args:
+            providers: List of provider names, or None for all providers
+            save_to_cache: Whether to save to cache
+            cache_filename: Cache filename to use
+
+        Returns:
+            M3U content as string
+        """
+        # Check if media proxy is configured — the bare stream route still
+        # depends on it at playback time, so fail the playlist build fast
+        # rather than handing out URLs that won't resolve.
+        if not self.media_proxy_url:
+            logger.error("Cannot generate M3U: MEDIA_PROXY_URL not set")
+            response.status = 503
+            response.content_type = "application/json"
+            return json.dumps(
+                {"error": "Media proxy not configured (MEDIA_PROXY_URL not set)"}
+            )
+
+        # Stream URLs stay relative; routes/m3u.py absolutizes.
+        base_url = ""
+
+        # Start M3U content
+        m3u_content = "#EXTM3U\n"
+
+        # Determine which providers to process
+        if providers is None:
+            providers_to_process = self.manager.list_providers()
+            cache_filename = cache_filename or "playlist.m3u"
+        else:
+            providers_to_process = (
+                [providers] if isinstance(providers, str) else providers
+            )
+            cache_filename = cache_filename or f"{providers_to_process[0]}.m3u"
+
+        channels_included = 0
+
+        for provider_name, provider_label, channels in self._iter_m3u_provider_channels(providers_to_process):
+            try:
+                for channel in channels:
+                    m3u_content += self._generate_m3u_entry(
+                        base_url, provider_name, channel,
+                        # Bare path — no ?client_drm=false, since that's the
+                        # route's own default. No KODIPROP line needed either
+                        # (drm_directives="") — the client never uses
+                        # inputstream.adaptive when the server decrypts.
+                        stream_path="stream/index.mpd",
+                        provider_label=provider_label,
+                        drm_directives="",
+                    )
+                    channels_included += 1
+
+            except Exception as provider_err:
+                logger.warning(
+                    f"Failed to process provider '{provider_name}': {str(provider_err)}"
+                )
+                continue
+
+        logger.info(f"Plain M3U: included {channels_included} channels")
+
+        # Save to cache if requested — safe here (see docstring: nothing on
+        # this path is request-time-volatile, and URLs are relative).
+        # Never cache an empty playlist: a failed provider lookup (unknown
+        # name, upstream outage) would otherwise be served for the whole TTL.
+        if save_to_cache and cache_filename and not channels_included:
+            logger.warning(f"Plain M3U has 0 channels — not caching {cache_filename}")
+        elif save_to_cache and cache_filename:
+            if self.vfs.write_text(cache_filename, m3u_content):
+                logger.info(f"M3U playlist cached to {cache_filename}")
+            else:
+                logger.warning(f"Failed to cache M3U playlist to {cache_filename}")
+
+        return m3u_content
+
+    def _generate_m3u_proxied_ffmpeg_fast(self, providers=None):
+        """
+        Fast generation of decrypted M3U content with ffmpeg piping for specified providers.
+        Includes ALL channels with highest quality video and ffmpeg-piped stream URLs.
+        No DRM filtering, no caching - maximum speed.
+
+        Stream URLs (inside the pipe:// command) are emitted RELATIVE; the
+        serve-time absolutizer in routes/m3u.py rewrites them together with
+        the plain format, so this endpoint's URLs also follow the incoming
+        request's host.
+
+        Args:
+            providers: List of provider names, or None for all providers
+
+        Returns:
+            M3U content as string
+        """
+        # Check if media proxy is configured
+        if not self.media_proxy_url:
+            logger.error("Cannot generate decrypted ffmpeg M3U: MEDIA_PROXY_URL not set")
+            response.status = 503
+            response.content_type = "application/json"
+            return json.dumps(
+                {"error": "Media proxy not configured (MEDIA_PROXY_URL not set)"}
+            )
+
+        # Stream URLs stay relative; routes/m3u.py absolutizes.
+        base_url = ""
+
+        # Start M3U content
+        m3u_content = "#EXTM3U\n"
+
+        # Determine which providers to process
+        if providers is None:
+            providers_to_process = self.manager.list_providers()
+        else:
+            providers_to_process = (
+                [providers] if isinstance(providers, str) else providers
+            )
+
+        channels_included = 0
+
+        for provider_name, provider_label, channels in self._iter_m3u_provider_channels(providers_to_process):
+            try:
+                # Process each channel - no DRM checks
+                for channel in channels:
+                    channel_id = channel.channel_id
+                    channel_name = channel.name
+
+                    # Build decrypted stream URL (ffmpeg variant with highest quality)
+                    # client_drm=false matches this playlist's static KODIPROP
+                    # line below (server decrypts); highest_quality_only=true
+                    # replaces the old dedicated /stream/proxied/ffmpeg/ path.
+                    stream_path = self.stream_path_for(
+                        channel, "stream/index.mpd?client_drm=false&highest_quality_only=true"
+                    )
+                    stream_url = f"/api/providers/{provider_name}/channels/{channel_id}/{stream_path}"
+                    if base_url:
+                        stream_url = f"{base_url}{stream_url}"
+
+                    # Build ffmpeg pipe command
+                    ffmpeg_cmd = self._build_ffmpeg_pipe_command(stream_url, channel_name)
+
+                    # Header only (EXTINF + KODIPROP) — this variant is
+                    # intentionally live-only, so include_catchup=False
+                    # preserves its existing behavior of never emitting
+                    # catchup attributes, even for channels that support it.
+                    # No KODIPROP line — client_drm=false here too (server
+                    # decrypts), and the stream target is a pipe://ffmpeg
+                    # command anyway, which inputstream.adaptive never touches.
+                    m3u_content += self._build_m3u_entry_header(
+                        provider_name, channel,
+                        provider_label=provider_label,
+                        drm_directives="",
+                        include_catchup=False,
+                    )
+                    m3u_content += f"{ffmpeg_cmd}\n"
+
+                    channels_included += 1
+
+            except Exception as provider_err:
+                logger.warning(
+                    f"Failed to process provider '{provider_name}': {str(provider_err)}"
+                )
+                continue
+
+        logger.info(f"Fast decrypted ffmpeg M3U: included {channels_included} channels")
+
+        # Set appropriate headers
+        response.content_type = "audio/x-mpegurl; charset=utf-8"
+
+        if providers and isinstance(providers, str):
+            # Single provider
+            response.headers["Content-Disposition"] = (
+                f'attachment; filename="{providers}_proxied_ffmpeg_playlist.m3u8"'
+            )
+        else:
+            # All providers
+            response.headers["Content-Disposition"] = (
+                'attachment; filename="playlist_proxied_ffmpeg.m3u8"'
+            )
+
+        return m3u_content
+
+    def _generate_m3u_proxied_filtered_content(
+            self, providers=None, save_to_cache=True, cache_filename=None
+    ):
+        """
+        Internal method to generate filtered decrypted M3U content for specified providers.
+        Only includes channels with ClearKey DRM or unencrypted channels.
+
+        Stream URLs are emitted RELATIVE; routes/m3u.py absolutizes.
+
+        Args:
+            providers: List of provider names, or None for all providers
+            save_to_cache: Whether to save to cache
+            cache_filename: Cache filename to use
+
+        Returns:
+            M3U content as string
+        """
+        # Check if media proxy is configured
+        if not self.media_proxy_url:
+            logger.error("Cannot generate decrypted M3U: MEDIA_PROXY_URL not set")
+            return None
+
+        # Stream URLs stay relative; routes/m3u.py absolutizes.
+        base_url = ""
+
+        # Start M3U content
+        m3u_content = "#EXTM3U\n"
+
+        # Determine which providers to process
+        if providers is None:
+            # All providers
+            providers_to_process = self.manager.list_providers()
+            cache_filename = cache_filename or "playlist_proxied_filtered.m3u"
+        else:
+            # Specific provider(s)
+            providers_to_process = (
+                [providers] if isinstance(providers, str) else providers
+            )
+            cache_filename = (
+                    cache_filename or f"{providers_to_process[0]}_proxied_filtered.m3u"
+            )
+
+        channels_included = 0
+        channels_skipped = 0
+
+        for provider_name, provider_label, channels in self._iter_m3u_provider_channels(providers_to_process):
+            try:
+                # Process each channel
+                for channel in channels:
+                    channel_id = channel.channel_id
+
+                    # Try to get DRM configs
+                    try:
+                        drm_configs = self.manager.get_channel_drm_configs(
+                            provider_name=provider_name, channel_id=channel_id
+                        )
+                        drm_dict = self._drm_configs_to_dict(drm_configs)
+
+                        # Check if channel has ClearKey DRM or is unencrypted
+                        has_clearkey = "org.w3.clearkey" in drm_dict and drm_dict["org.w3.clearkey"]
+                        is_unencrypted = "none" in drm_dict
+
+                        if has_clearkey:
+                            # Channel has ClearKey - generate proxied entry.
+                            # include_catchup=True matches this branch's
+                            # pre-consolidation behavior (the old
+                            # _generate_m3u_proxied_channel_entry always
+                            # included catchup tags when available).
+                            # No KODIPROP line — client_drm=false, client
+                            # doesn't use inputstream.adaptive.
+                            m3u_content += self._generate_m3u_entry(
+                                base_url, provider_name, channel,
+                                stream_path="stream/index.mpd?client_drm=false",
+                                provider_label=provider_label,
+                                drm_directives="",
+                                include_catchup=True,
+                            )
+                            channels_included += 1
+                        elif is_unencrypted:
+                            # Explicitly unencrypted channel - include with direct
+                            # stream URL. include_catchup=True — previously this
+                            # branch never included catchup tags, unlike the
+                            # ClearKey branch above; fixed so both branches behave
+                            # consistently (deliberate change, not preserved
+                            # pre-consolidation behavior).
+                            m3u_content += self._generate_m3u_entry(
+                                base_url, provider_name, channel,
+                                stream_path="stream/index.mpd",
+                                provider_label=provider_label,
+                                drm_directives="",
+                                include_catchup=True,
+                            )
+                            channels_included += 1
+                        else:
+                            # Channel has other DRM, is inaccessible, or unknown - skip
+                            channels_skipped += 1
+                            logger.debug(
+                                f"Skipping {provider_name}/{channel_id} - unsupported DRM or no access"
+                            )
+
+                    except Exception as drm_err:
+                        # Could not get DRM info - skip channel
+                        logger.warning(
+                            f"Could not get DRM for {provider_name}/{channel_id}: {drm_err}"
+                        )
+                        channels_skipped += 1
+                        continue
+
+            except Exception as provider_err:
+                logger.warning(
+                    f"Failed to process provider '{provider_name}': {str(provider_err)}"
+                )
+                continue
+
+        logger.info(
+            f"Filtered decrypted M3U: included {channels_included} channels, skipped {channels_skipped}"
+        )
+
+        # Save to cache if requested (never an empty playlist)
+        if save_to_cache and cache_filename and not channels_included:
+            logger.warning(f"Filtered M3U has 0 channels — not caching {cache_filename}")
+        elif save_to_cache and cache_filename:
+            if self.vfs.write_text(cache_filename, m3u_content):
+                logger.info(f"Filtered decrypted M3U playlist cached to {cache_filename}")
+            else:
+                logger.warning(
+                    f"Failed to cache filtered decrypted M3U playlist to {cache_filename}"
+                )
+
+        return m3u_content
+
+    def _generate_m3u_content(
+        self, providers=None, save_to_cache=True, cache_filename=None, no_proxy=False
+    ):
+        """
+        Internal method to generate M3U content for specified providers, on
+        the client-side-decrypt route (client_drm=true — dynamic per-channel
+        DRM lookup via _generate_drm_directives, which embeds whatever the
+        channel's DRM system needs: ClearKey key/kid pairs inlined directly,
+        or a Widevine/PlayReady license server URL (+ headers) for the
+        client's inputstream.adaptive to negotiate against at playback
+        time. Not limited to ClearKey channels.
+
+        This backs the "clientdrm" playlists (generate_m3u_clientdrm_all/
+        _provider, always save_to_cache=False — see those wrappers for why)
+        and the pre-existing "/m3u/noproxy" playlists, which combine
+        client-side decrypt with a forced non-proxied stream route.
+
+        Stream URLs are emitted RELATIVE; routes/m3u.py absolutizes.
+
+        Args:
+            providers: List of provider names, or None for all providers
+            save_to_cache: Whether to save to cache
+            cache_filename: Cache filename to use
+            no_proxy: If True, generate entries pointing at the non-proxied stream
+                      routes, and cache under a "_noproxy" suffixed filename so this
+                      never collides with the normal proxied cache file.
+
+        Returns:
+            M3U content as string
+        """
+        # Stream URLs stay relative; routes/m3u.py absolutizes.
+        base_url = ""
+
+        # Start M3U content
+        m3u_content = "#EXTM3U\n"
+
+        # Determine which providers to process
+        if providers is None:
+            # All providers
+            providers_to_process = self.manager.list_providers()
+            cache_filename = cache_filename or "playlist.m3u"
+        else:
+            # Specific provider(s)
+            providers_to_process = (
+                [providers] if isinstance(providers, str) else providers
+            )
+            cache_filename = cache_filename or f"{providers_to_process[0]}.m3u"
+
+        # IMPORTANT: apply the no_proxy suffix AFTER cache_filename has been
+        # resolved to its default above. Doing this earlier (before the default
+        # is assigned) means cache_filename is still None here and the suffix
+        # never gets applied — the noproxy playlist then silently caches under
+        # the SAME filename as the proxied playlist, corrupting it.
+        if no_proxy:
+            if "." in cache_filename:
+                base_name, ext = cache_filename.rsplit(".", 1)
+                cache_filename = f"{base_name}_noproxy.{ext}"
+            else:
+                cache_filename = f"{cache_filename}_noproxy"
+
+        # /stream/noproxy/ and /stream/sw-drm/ no longer exist as separate
+        # routes — folded into query params on the single /stream/index.mpd
+        # endpoint. client_drm=true because this playlist's KODIPROP
+        # directives come from a dynamic per-channel DRM lookup (see the
+        # drm_directives=None call below / _build_m3u_entry_header), which
+        # only makes sense if the client is the one doing the decrypting —
+        # client_drm now defaults to false, so this has to be explicit or
+        # every entry here would silently mismatch its own KODIPROP directives.
+        stream_path = "stream/index.mpd?client_drm=true&no_proxy=true" if no_proxy else "stream/index.mpd?client_drm=true"
+
+        channels_included = 0
+
+        for provider_name, provider_label, channels in self._iter_m3u_provider_channels(providers_to_process):
+            try:
+                # Add each channel to M3U
+                for channel in channels:
+                    m3u_content += self._generate_m3u_entry(
+                        base_url, provider_name, channel,
+                        stream_path=stream_path,
+                        provider_label=provider_label,
+                    )
+                    channels_included += 1
+
+            except Exception as provider_err:
+                logger.warning(
+                    f"Failed to process provider '{provider_name}': {str(provider_err)}"
+                )
+                continue
+
+        # Save to cache if requested (never an empty playlist)
+        if save_to_cache and cache_filename and not channels_included:
+            logger.warning(f"M3U has 0 channels — not caching {cache_filename}")
+        elif save_to_cache and cache_filename:
+            if self.vfs.write_text(cache_filename, m3u_content):
+                logger.info(f"M3U playlist cached to {cache_filename}")
+            else:
+                logger.warning(f"Failed to cache M3U playlist to {cache_filename}")
+
+        return m3u_content
+
+    @staticmethod
+    def _encode_kodiprop_headers(headers) -> Optional[str]:
+        """
+        Encode a header dict as the URL-encoded "k=v&k=v" value that
+        inputstream.adaptive expects for manifest_headers / stream_headers.
+
+        Returns:
+            ""   — nothing to send (None or empty mapping)
+            str  — the encoded headers
+            None — not representable (not a mapping, empty/non-string name,
+                   non-string value). Callers skip the channel: a half-sent
+                   header set means an auth failure with no useful log.
+
+        quote (%20) rather than urlencode's default quote_plus ('+'): the
+        value is decoded by Kodi, not by a form parser, so spaces must be
+        %20. Encoding also guarantees a header value can never contain a
+        raw newline that would break the single KODIPROP line.
+        """
+        if not headers:
+            return "" if headers is None or isinstance(headers, dict) else None
+        if not isinstance(headers, dict):
+            return None
+        for name, value in headers.items():
+            if not isinstance(name, str) or not name or not isinstance(value, str):
+                return None
+        return urlencode(headers, quote_via=quote)
+
+    def _generate_m3u_noproxy_raw_content(self, providers=None):
+        """
+        Like _generate_m3u_content(no_proxy=True), but resolves each channel's
+        upstream manifest URL at generation time and writes it straight into
+        the playlist, removing the /stream/index.mpd redirect hop.
+
+        Headers: the provider's manifest and segment headers are emitted as
+        inputstream.adaptive.manifest_headers / .stream_headers KODIPROPs
+        (activating inputstream.adaptive for the entry if DRM didn't already).
+        They are looked up AFTER the manifest URL, as at playback time —
+        a provider may establish its session/token while resolving the URL.
+        Lookup mirrors fetch_manifest_for_rewriter: no catchup kwargs (only
+        live is emitted), no country (unknown at playlist time).
+
+        A channel is SKIPPED, never downgraded to the redirect URL, when:
+          - the provider has requires_manifest_context, or
+          - the manifest URL could not be resolved / is empty, or
+          - the header lookup raised or the headers are not encodable, or
+          - the DRM lookup raised.
+
+        Catchup attributes are intentionally NOT emitted: catchup_type
+        "append" would append ?start_time=...&end_time=... to the raw
+        upstream live URL, which the upstream does not understand (the
+        redirect route is what translates it).
+
+        Deliberately UNCACHED — raw URLs and header tokens can both be
+        short-lived. Never log header values.
+
+        NOTE: because this function emits ABSOLUTE UPSTREAM URLs (never
+        /api/providers/...), the serve-time absolutizer in routes/m3u.py
+        leaves the body alone. Intentional — the client should hit the
+        provider directly, not our server.
+
+        Returns:
+            (m3u_content, channels_included, channels_skipped)
+        """
+        m3u_content = "#EXTM3U\n"
+
+        if providers is None:
+            providers_to_process = self.manager.list_providers()
+        else:
+            providers_to_process = (
+                [providers] if isinstance(providers, str) else providers
+            )
+
+        total_included = 0
+        total_skipped = 0
+
+        for provider_name, provider_label, channels in self._iter_m3u_provider_channels(providers_to_process):
+            included = 0
+            provider_skip_reason = None
+            try:
+                provider_instance = self.manager.get_provider(provider_name)
+                if provider_instance is None:
+                    provider_skip_reason = "provider resolved to None"
+                elif getattr(provider_instance, "requires_manifest_context", False):
+                    provider_skip_reason = "provider requires manifest context"
+
+                if provider_skip_reason is None:
+                    for channel in channels:
+                        channel_id = channel.channel_id
+
+                        try:
+                            manifest_url = self.manager.get_channel_manifest(
+                                provider_name=provider_name, channel_id=channel_id
+                            )
+                        except Exception as url_err:
+                            logger.warning(
+                                f"noproxy/raw: could not resolve manifest URL for "
+                                f"{provider_name}/{channel_id}: {url_err} — skipping"
+                            )
+                            continue
+
+                        if not manifest_url:
+                            logger.warning(
+                                f"noproxy/raw: empty manifest URL for "
+                                f"{provider_name}/{channel_id} — skipping"
+                            )
+                            continue
+
+                        try:
+                            manifest_headers = provider_instance.get_manifest_headers(channel_id)
+                            segment_headers = provider_instance.get_segment_headers(channel_id)
+                        except Exception as hdr_err:
+                            logger.warning(
+                                f"noproxy/raw: header lookup failed for "
+                                f"{provider_name}/{channel_id}: {hdr_err} — skipping"
+                            )
+                            continue
+
+                        manifest_hdr_enc = self._encode_kodiprop_headers(manifest_headers)
+                        segment_hdr_enc = self._encode_kodiprop_headers(segment_headers)
+                        if manifest_hdr_enc is None or segment_hdr_enc is None:
+                            logger.warning(
+                                f"noproxy/raw: headers not encodable for "
+                                f"{provider_name}/{channel_id} — skipping"
+                            )
+                            continue
+
+                        # DRM lookup done here, not via drm_directives=None:
+                        # _build_m3u_entry_header swallows lookup errors and
+                        # would emit a keyless (undecryptable) entry. Strict
+                        # like _generate_m3u_proxied_filtered_content, which
+                        # also skips a channel whose DRM lookup raises.
+                        try:
+                            drm_configs = self.manager.get_channel_drm_configs(
+                                provider_name=provider_name, channel_id=channel_id
+                            )
+                        except Exception as drm_err:
+                            logger.warning(
+                                f"noproxy/raw: DRM lookup failed for "
+                                f"{provider_name}/{channel_id}: {drm_err} — skipping"
+                            )
+                            continue
+
+                        m3u_content += self._build_m3u_entry_header(
+                            provider_name, channel,
+                            provider_label=provider_label,
+                            drm_directives=(
+                                self._generate_drm_directives(drm_configs)
+                                if drm_configs else ""
+                            ),
+                            include_catchup=False,
+                            manifest_headers_encoded=manifest_hdr_enc,
+                            segment_headers_encoded=segment_hdr_enc,
+                        )
+                        m3u_content += f"{manifest_url}\n"
+                        included += 1
+
+            except Exception as provider_err:
+                logger.warning(
+                    f"noproxy/raw: failed to process provider '{provider_name}': {provider_err}"
+                )
+
+            skipped = len(channels) - included
+            total_included += included
+            total_skipped += skipped
+
+            if provider_skip_reason:
+                logger.warning(
+                    f"noproxy/raw: provider '{provider_name}' skipped entirely "
+                    f"({provider_skip_reason}) — {skipped} channels omitted"
+                )
+            elif included == 0 and skipped > 0:
+                logger.warning(
+                    f"noproxy/raw: provider '{provider_name}' contributed 0 of "
+                    f"{skipped} channels (all failed to resolve or encode)"
+                )
+            elif skipped:
+                logger.info(
+                    f"noproxy/raw: provider '{provider_name}': {included} included, {skipped} skipped"
+                )
+
+        logger.info(
+            f"noproxy/raw M3U: included {total_included} channels, skipped {total_skipped}"
+        )
+        return m3u_content, total_included, total_skipped
+
+    # ------------------------------------------------------------------
+    # TS playlist (m3u/proxied/ts)
+    #
+    # Each entry's stream URL points straight at the MPEG-TS proxy
+    # (TS_PROXY_URL) and mirrors this backend's own stream route with a .ts
+    # extension:
+    #     {TS_PROXY_URL}/api/providers/<provider>/channels/<id>/stream/index.ts
+    # The proxy asks this backend for the matching index.mpd itself, with
+    # client_drm=false&highest_quality_only=true forced, so provider headers,
+    # geo-proxying and server-side ClearKey decryption all keep working — the
+    # proxy only remuxes the already-clear stream into TS. Nothing about the
+    # backend's address is baked into the playlist.
+    #
+    # Filtering matches _generate_m3u_proxied_filtered_content: ClearKey or
+    # unencrypted channels only, since the converter cannot decrypt DRM itself
+    # (ClearKey is playable here only because client_drm=false makes the
+    # server decrypt via the media proxy before the converter ever sees the
+    # stream — without MEDIA_PROXY_URL, ClearKey channels are skipped too).
+    #
+    # Live-only like the ffmpeg variant (include_catchup=False). No KODIPROP
+    # directives either — the entry is a plain HTTP TS URL played by the
+    # regular demuxer, not by inputstream.adaptive.
+    #
+    # Deliberately UNCACHED: it depends on an external service that may be
+    # (re)started independently. Hence no /generate route variants either —
+    # there is nothing to regenerate.
+    #
+    # Entry URLs are ABSOLUTE (the proxy's), never /api/providers/..., so the
+    # serve-time absolutizer in routes/m3u.py leaves them alone — same as the
+    # noproxy/raw variant.
+    # ------------------------------------------------------------------
+
+    # Throttle interval for the ClearKey-without-proxy skip warning below:
+    # same one-per-interval shape as FALLBACK_WARN_INTERVAL_SECONDS /
+    # _warn_fallback_throttled in routes/m3u.py (an hour is enough — the
+    # condition is static per deployment). Only the IMMUTABLE interval
+    # lives at class level; the timestamp is per-instance state owned by
+    # __init__, so multiple service instances in one process can never
+    # suppress each other's warnings.
+    _CLEARKEY_SKIP_WARN_INTERVAL_SECONDS = 60 * 60
+
+    def _warn_clearkey_skip_throttled(self) -> None:
+        """Warn at most once per interval that ClearKey channels are being
+        dropped from the TS playlist because MEDIA_PROXY_URL is unset.
+
+        Without this the only symptom is a silently shorter playlist — a
+        misconfiguration (ClearKey channels exist but nothing can decrypt
+        them for the converter) that deserves to surface somewhere louder than
+        per-channel debug logs. Mirrors _warn_fallback_throttled in
+        routes/m3u.py.
+        """
+        now = time.time()
+        if (
+            now - self._last_clearkey_skip_warning
+            >= self._CLEARKEY_SKIP_WARN_INTERVAL_SECONDS
+        ):
+            self._last_clearkey_skip_warning = now
+            logger.warning(
+                "TS M3U: skipping ClearKey channel(s) - MEDIA_PROXY_URL is "
+                "unset, so client_drm=false cannot decrypt server-side for "
+                "the TS proxy; only unencrypted channels are included. Set "
+                "MEDIA_PROXY_URL to convert ClearKey channels too. "
+                "(Repeats suppressed for %ss.)"
+                % self._CLEARKEY_SKIP_WARN_INTERVAL_SECONDS
+            )
+
+    def _generate_m3u_proxied_ts_content(self, providers=None):
+        """
+        Internal method to generate the TS-proxy M3U content
+        for the given providers. See the block comment above for the design.
+
+        Args:
+            providers: List of provider names, or None for all providers
+
+        Returns:
+            (m3u_content, channels_included, channels_skipped), or None
+            when TS_PROXY_URL is unset — the caller (_serve_m3u_proxied_ts)
+            renders the 503 JSON error for that case, mirroring the None
+            sentinel of _generate_m3u_proxied_filtered_content.
+        """
+        # TS_PROXY_URL gates the whole feature: without a TS proxy there is
+        # nothing to point entries at, and unlike the plain playlist's
+        # clientdrm fallback there is no meaningful degraded mode for TS.
+        # Plain None — not a JSON body plus response side effects: the
+        # caller owns the 503 rendering, so this guard can never be fooled
+        # by a status code some other code in the call chain happened to
+        # set (same convention as _generate_m3u_proxied_filtered_content).
+        if not self.ts_proxy_url:
+            logger.error("Cannot generate TS M3U: TS_PROXY_URL not set")
+            return None
+
+        ts_base = self.ts_proxy_url
+
+        # ClearKey channels are only playable through the TS proxy when the
+        # media proxy can decrypt them server-side (client_drm=false). With
+        # MEDIA_PROXY_URL unset the stream route would 503 for them, so skip
+        # them here rather than emit entries that fail at playback time.
+        # Unencrypted channels keep working either way.
+        clearkey_playable = bool(self.media_proxy_url)
+
+        m3u_content = "#EXTM3U\n"
+
+        # Determine which providers to process
+        if providers is None:
+            providers_to_process = self.manager.list_providers()
+        else:
+            providers_to_process = (
+                [providers] if isinstance(providers, str) else providers
+            )
+
+        channels_included = 0
+        channels_skipped = 0
+
+        for provider_name, provider_label, channels in self._iter_m3u_provider_channels(providers_to_process):
+            try:
+                # Process each channel
+                for channel in channels:
+                    channel_id = channel.channel_id
+
+                    # Try to get DRM configs
+                    try:
+                        drm_configs = self.manager.get_channel_drm_configs(
+                            provider_name=provider_name, channel_id=channel_id
+                        )
+                        drm_dict = self._drm_configs_to_dict(drm_configs)
+
+                        # Same inclusion rule as
+                        # _generate_m3u_proxied_filtered_content: ClearKey (when
+                        # the proxy can decrypt it for the converter) or explicitly
+                        # unencrypted. Anything else — Widevine/PlayReady,
+                        # inaccessible, or unknown — is skipped: the converter
+                        # cannot decrypt it, so an entry would just fail.
+                        has_clearkey = "org.w3.clearkey" in drm_dict and drm_dict["org.w3.clearkey"]
+                        is_unencrypted = "none" in drm_dict
+
+                        if has_clearkey and not clearkey_playable:
+                            channels_skipped += 1
+                            # Config-signal warning, throttled to once per
+                            # interval — the per-channel detail below stays
+                            # at debug level because the warning is about
+                            # the deployment, not this channel.
+                            self._warn_clearkey_skip_throttled()
+                            logger.debug(
+                                f"TS M3U: skipping {provider_name}/{channel_id} - ClearKey "
+                                f"needs the media proxy (MEDIA_PROXY_URL not set)"
+                            )
+                            continue
+
+                        if not (has_clearkey or is_unencrypted):
+                            channels_skipped += 1
+                            logger.debug(
+                                f"TS M3U: skipping {provider_name}/{channel_id} - unsupported DRM or no access"
+                            )
+                            continue
+
+                        # TS proxy entry: the backend's stream route with a .ts
+                        # extension. The proxy forces client_drm=false and
+                        # highest_quality_only=true itself, so the URL carries
+                        # no query at all.
+                        ts_url = (
+                            f"{ts_base}/api/providers/{quote(provider_name, safe='')}"
+                            f"/channels/{quote(str(channel_id), safe='')}/stream/index.ts"
+                        )
+
+                        # Header only (EXTINF, no KODIPROP) — live-only, so
+                        # include_catchup=False suppresses catchup attributes
+                        # even for channels that support DVR: an endless TS
+                        # has no seekable window. No inputstream.adaptive
+                        # directives — a plain TS URL is played by the regular
+                        # demuxer.
+                        m3u_content += self._build_m3u_entry_header(
+                            provider_name, channel,
+                            provider_label=provider_label,
+                            drm_directives="",
+                            include_catchup=False,
+                        )
+                        m3u_content += f"{ts_url}\n"
+                        channels_included += 1
+
+                    except Exception as drm_err:
+                        # Could not get DRM info - skip channel
+                        logger.warning(
+                            f"TS M3U: could not get DRM for {provider_name}/{channel_id}: {drm_err}"
+                        )
+                        channels_skipped += 1
+                        continue
+
+            except Exception as provider_err:
+                logger.warning(
+                    f"Failed to process provider '{provider_name}': {str(provider_err)}"
+                )
+                continue
+
+        logger.info(
+            f"TS M3U: included {channels_included} channels, skipped {channels_skipped}"
+        )
+
+        return m3u_content, channels_included, channels_skipped
+
+    def _generate_m3u_proxied_filtered_all(self, save_to_cache: bool = False) -> str:
+        """Internal method to generate filtered decrypted M3U for all providers."""
+        logger.info("Generating filtered decrypted M3U playlist for all providers")
+        m3u_content = self._generate_m3u_proxied_filtered_content(
+            providers=None, save_to_cache=save_to_cache
+        )
+
+        if m3u_content is None:
+            response.status = 503
+            response.content_type = "application/json"
+            return json.dumps(
+                {"error": "Media proxy not configured (MEDIA_PROXY_URL not set)"}
+            )
+
+        # Set appropriate headers for M3U
+        response.content_type = "audio/x-mpegurl; charset=utf-8"
+        response.headers["Content-Disposition"] = (
+            'attachment; filename="playlist_proxied_filtered.m3u8"'
+        )
+
+        return m3u_content
+
+    def _generate_m3u_proxied_filtered_provider(
+            self, provider: str, save_to_cache: bool = False
+    ) -> str:
+        """Internal method to generate filtered decrypted M3U for a specific provider."""
+        logger.info(f"Generating filtered decrypted M3U playlist for provider '{provider}'")
+        m3u_content = self._generate_m3u_proxied_filtered_content(
+            providers=provider, save_to_cache=save_to_cache
+        )
+
+        if m3u_content is None:
+            response.status = 503
+            response.content_type = "application/json"
+            return json.dumps(
+                {"error": "Media proxy not configured (MEDIA_PROXY_URL not set)"}
+            )
+
+        # Set appropriate headers for M3U
+        response.content_type = "audio/x-mpegurl; charset=utf-8"
+        response.headers["Content-Disposition"] = (
+            f'attachment; filename="{provider}_proxied_filtered_playlist.m3u8"'
+        )
+
+        return m3u_content
+
+    @staticmethod
+    def _build_ffmpeg_pipe_command(stream_url: str, channel_name: str) -> str:
+        """
+        Build the ffmpeg pipe:// command used by the ffmpeg-piped M3U variant.
+
+        Input options:
+        - -loglevel error: "fatal" hides reconnect events; "error" keeps stderr
+          clean in normal operation but makes source flapping visible in the
+          tvheadend log.
+        - -fflags +genpts+igndts+discardcorrupt: robustness trio for live remux.
+        - -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 10: retry on
+          dropped connections; the streamed variant because the MPD response is
+          not seekable.
+        - -rw_timeout 15000000 (15s): a stalled TCP connection that never
+          errors out would hang this pipe forever while tvheadend shows a
+          "running" mux with no data. A read timeout makes ffmpeg exit instead,
+          so the pipe gets restarted. Prefer dying over hanging.
+        - -thread_queue_size 2048: large enough to demux multiple audio tracks
+          smoothly.
+        - No -re: the source is live DASH and already arrives in real time;
+          -re would prevent catch-up after a stall, ratcheting latency up
+          permanently.
+
+        Output options:
+        - -map 0:v:0: single video stream (upstream is requested with
+          highest_quality_only=true).
+        - -map 0:a?: all available audio tracks (channels commonly carry
+          multiple, e.g. German/English AAC + AC-3); "?" keeps this from
+          failing on channels with no audio.
+        - -c copy: pure remux, no transcoding.
+        - -max_muxing_queue_size 8192: safely interleaves multi-audio timescales.
+        - -muxdelay 0 -muxpreload 0 -flush_packets 1: minimal mux/flush latency.
+        - -mpegts_flags resend_headers: PAT/PMT re-sent periodically so
+          tvheadend and newly joined clients can sync mid-stream.
+        """
+        return (
+            'pipe://ffmpeg -loglevel fatal '
+            '-fflags +genpts+igndts+discardcorrupt '
+            '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 10 '
+            '-rw_timeout 15000000 '
+            '-thread_queue_size 2048 '
+            f'-i "{stream_url}" '
+            '-map 0:v:0 '
+            '-map 0:a? '
+            '-c copy '
+            '-max_muxing_queue_size 8192 '
+            '-f mpegts '
+            '-muxdelay 0 -muxpreload 0 '
+            '-mpegts_flags resend_headers '
+            f'-metadata service_name="{channel_name}" '
+            '-flush_packets 1 '
+            'pipe:1'
+        )
+
+    @staticmethod
+    def _chno_attr(channel) -> str:
+        """Return ' tvg-chno="N" ch-number="N"' when channel_number is set, else empty string."""
+        chno = getattr(channel, "channel_number", None)
+        return f' tvg-chno="{chno}" ch-number="{chno}"' if chno is not None else ""
+
+    @staticmethod
+    def _drm_configs_to_dict(drm_configs) -> dict:
+        """
+        Normalize DRM configs (list of DRMConfig/dict objects, or an
+        already-merged dict) into a single dict keyed by DRM scheme.
+
+        Shared by _generate_drm_directives and _generate_m3u_proxied_filtered_content,
+        which each used to do this same list-to-dict merge independently.
+        """
+        if isinstance(drm_configs, dict):
+            return drm_configs
+
+        merged = {}
+        if isinstance(drm_configs, list):
+            for config in drm_configs:
+                if hasattr(config, "to_dict"):
+                    merged.update(config.to_dict())
+                elif isinstance(config, dict):
+                    merged.update(config)
+        return merged
+
+    def _generate_drm_directives(self, drm_configs):
+        """
+        Generate KODIPROP directives for DRM configuration.
+
+        Args:
+            drm_configs: DRM configurations as a dictionary (not list)
+
+        Returns:
+            DRM directives as string
+        """
+        directives = ""
+
+        drm_configs = self._drm_configs_to_dict(drm_configs)
+        if not drm_configs:
+            return directives
+
+        # Rest of the method remains the same...
+        # Prioritize: clearkey > widevine > playready
+        selected_drm = None
+        priority_order = [
+            "org.w3.clearkey",
+            "com.widevine.alpha",
+            "com.microsoft.playready",
+        ]
+
+        for priority_system in priority_order:
+            if priority_system in drm_configs:
+                selected_drm = (priority_system, drm_configs[priority_system])
+                break
+
+        if selected_drm:
+            drm_system, drm_data = selected_drm
+
+            # Add KODIPROP directives
+            directives += "#KODIPROP:inputstream=inputstream.adaptive\n"
+
+            # Build DRM legacy string
+            drm_legacy_parts = [drm_system]
+
+            license_info = drm_data.get("license", {})
+
+            # Add license server URL or keyids
+            if drm_system == "org.w3.clearkey" and license_info.get("keyids"):
+                # ClearKey: format as kid:key,kid:key
+                keyids = license_info["keyids"]
+                keys_str = ",".join([f"{kid}:{key}" for kid, key in keyids.items()])
+                drm_legacy_parts.append(keys_str)
+            elif license_info.get("server_url"):
+                # Widevine/PlayReady: add license server URL
+                drm_legacy_parts.append(license_info["server_url"])
+
+                # Add headers if present (URL-encoded)
+                if license_info.get("req_headers"):
+                    req_headers = self._process_license_headers(
+                        license_info["req_headers"]
+                    )
+                    if req_headers:
+                        drm_legacy_parts.append(req_headers)
+
+            # Join parts with pipe separator
+            drm_legacy = "|".join(drm_legacy_parts)
+            directives += f"#KODIPROP:inputstream.adaptive.drm_legacy={drm_legacy}\n"
+
+        return directives
+
+    # ── Public API for route modules ─────────────────────────────────────────────
+
+    def get_epg_id(self, channel_id: str) -> Optional[str]:
+        """Public wrapper for EPG ID lookup."""
+        return self._get_epg_id(channel_id)
+
+    def generate_m3u_plain_all(self, save_to_cache: bool = False) -> str:
+        """
+        Public wrapper: server-side-decrypt M3U for all providers (bare
+        stream URLs, no query string). This is "/api/m3u" — cached by
+        default when called from the route (save_to_cache=True there).
+        """
+        logger.info("Generating M3U playlist for all providers")
+        m3u_content = self._generate_m3u_plain_content(providers=None, save_to_cache=save_to_cache)
+
+        response.content_type = "audio/x-mpegurl; charset=utf-8"
+        response.headers["Content-Disposition"] = 'attachment; filename="playlist.m3u8"'
+
+        return m3u_content
+
+    def generate_m3u_plain_provider(self, provider: str, save_to_cache: bool = False) -> str:
+        """Public wrapper: server-side-decrypt M3U for a specific provider."""
+        logger.info(f"Generating M3U playlist for provider '{provider}'")
+        m3u_content = self._generate_m3u_plain_content(providers=provider, save_to_cache=save_to_cache)
+
+        response.content_type = "audio/x-mpegurl; charset=utf-8"
+        response.headers["Content-Disposition"] = f'attachment; filename="{provider}_playlist.m3u8"'
+
+        return m3u_content
+
+    def generate_m3u_clientdrm_all(self) -> str:
+        """
+        Public wrapper: client-side-decrypt M3U for all providers (dynamic
+        per-channel DRM lookup — ClearKey key/kid pairs inlined directly,
+        or a Widevine/PlayReady license server URL + headers, whichever
+        the channel actually uses; not limited to ClearKey providers).
+        Deliberately UNCACHED, unlike the plain playlist above — the
+        embedded DRM config (keys, or license URLs/tokens) can rotate
+        upstream, and a cached playlist would silently serve stale
+        credentials until someone force-regenerates it. Generating fresh
+        per request avoids that failure mode entirely; add a short TTL
+        later if per-request DRM-config lookups turn out to be too
+        frequent/expensive in practice.
+        """
+        logger.info("Generating clientdrm M3U playlist for all providers")
+        m3u_content = self._generate_m3u_content(providers=None, save_to_cache=False)
+
+        response.content_type = "audio/x-mpegurl; charset=utf-8"
+        response.headers["Content-Disposition"] = 'attachment; filename="playlist_clientdrm.m3u8"'
+
+        return m3u_content
+
+    def generate_m3u_clientdrm_provider(self, provider: str) -> str:
+        """Public wrapper: client-side-decrypt M3U for a specific provider. Uncached — see generate_m3u_clientdrm_all."""
+        logger.info(f"Generating clientdrm M3U playlist for provider '{provider}'")
+        m3u_content = self._generate_m3u_content(providers=provider, save_to_cache=False)
+
+        response.content_type = "audio/x-mpegurl; charset=utf-8"
+        response.headers["Content-Disposition"] = f'attachment; filename="{provider}_playlist_clientdrm.m3u8"'
+
+        return m3u_content
+
+    def generate_m3u_noproxy_all(self, save_to_cache: bool = False) -> str:
+        """
+        Public wrapper: client-side-decrypt M3U for all providers, forced
+        onto the non-proxied stream route (client_drm=true&no_proxy=true).
+        Backs "/api/m3u/noproxy" — unrelated to this turn's plain/clientdrm
+        split, kept exactly as it behaved before (cached, via
+        _generate_m3u_content). Renamed from the old generate_m3u_all only
+        because that name now belongs to the plain-playlist wrapper above.
+        """
+        logger.info("Generating no-proxy M3U playlist for all providers")
+        m3u_content = self._generate_m3u_content(providers=None, save_to_cache=save_to_cache, no_proxy=True)
+
+        response.content_type = "audio/x-mpegurl; charset=utf-8"
+        response.headers["Content-Disposition"] = 'attachment; filename="playlist_noproxy.m3u8"'
+
+        return m3u_content
+
+    def generate_m3u_noproxy_provider(self, provider: str, save_to_cache: bool = False) -> str:
+        """Public wrapper: no-proxy M3U for a specific provider. See generate_m3u_noproxy_all."""
+        logger.info(f"Generating no-proxy M3U playlist for provider '{provider}'")
+        m3u_content = self._generate_m3u_content(providers=provider, save_to_cache=save_to_cache, no_proxy=True)
+
+        response.content_type = "audio/x-mpegurl; charset=utf-8"
+        response.headers["Content-Disposition"] = f'attachment; filename="{provider}_playlist_noproxy.m3u8"'
+
+        return m3u_content
+
+    def _serve_m3u_noproxy_raw(self, providers, filename: str) -> str:
+        """Shared body of the noproxy/raw public wrappers: generate, set headers."""
+        m3u_content, included, skipped = self._generate_m3u_noproxy_raw_content(providers=providers)
+
+        response.content_type = "audio/x-mpegurl; charset=utf-8"
+        response.headers["Content-Disposition"] = f'attachment; filename="{filename}"'
+        # Raw upstream URLs may embed short-lived tokens: keep clients and
+        # intermediaries from caching the playlist either.
+        response.headers["Cache-Control"] = "no-store"
+        # Skips are otherwise invisible to the client (a shorter playlist).
+        response.headers["X-M3U-Channels-Included"] = str(included)
+        response.headers["X-M3U-Channels-Skipped"] = str(skipped)
+
+        return m3u_content
+
+    def generate_m3u_noproxy_raw_all(self) -> str:
+        """
+        Public wrapper: clientdrm M3U with raw upstream manifest URLs (no
+        redirect hop) for all providers. Backs "/api/m3u/noproxy/raw".
+        Deliberately UNCACHED — see _generate_m3u_noproxy_raw_content.
+        """
+        logger.info("Generating noproxy/raw M3U playlist for all providers")
+        return self._serve_m3u_noproxy_raw(None, "playlist_noproxy_raw.m3u8")
+
+    def generate_m3u_noproxy_raw_provider(self, provider: str) -> str:
+        """Public wrapper: noproxy/raw M3U for a single provider. Uncached."""
+        logger.info(f"Generating noproxy/raw M3U playlist for provider '{provider}'")
+        return self._serve_m3u_noproxy_raw(provider, f"{provider}_playlist_noproxy_raw.m3u8")
+
+    def generate_m3u_proxied_ffmpeg_fast(self, providers=None) -> str:
+        """Public wrapper for fast ffmpeg-decrypted M3U generation."""
+        return self._generate_m3u_proxied_ffmpeg_fast(providers)
+
+    def generate_m3u_proxied_filtered_all(self, save_to_cache: bool = False) -> str:
+        """Public wrapper for filtered decrypted M3U (all providers)."""
+        return self._generate_m3u_proxied_filtered_all(save_to_cache=save_to_cache)
+
+    def generate_m3u_proxied_filtered_provider(self, provider: str, save_to_cache: bool = False) -> str:
+        """Public wrapper for filtered decrypted M3U (single provider)."""
+        return self._generate_m3u_proxied_filtered_provider(provider, save_to_cache=save_to_cache)
+
+    def _serve_m3u_proxied_ts(self, providers, filename: str) -> str:
+        """Shared body of the TS public wrappers: generate, set headers."""
+        result = self._generate_m3u_proxied_ts_content(providers=providers)
+
+        # Not configured: render the 503 JSON here. Same None-sentinel
+        # convention as _generate_m3u_proxied_filtered_all/_provider — the
+        # old response.status_code >= 400 probe depended on response side
+        # effects set deep inside the generator, which made it fragile
+        # against anything else mutating the response on the way in. The
+        # channel-count headers below correctly stay unset on this path.
+        if result is None:
+            response.status = 503
+            response.content_type = "application/json"
+            return json.dumps(
+                {"error": "TS proxy not configured (TS_PROXY_URL not set)"}
+            )
+
+        m3u_content, included, skipped = result
+
+        response.content_type = "audio/x-mpegurl; charset=utf-8"
+        response.headers["Content-Disposition"] = f'attachment; filename="{filename}"'
+        # The entries depend on an external service that may be restarted or
+        # moved independently: keep clients and intermediaries from caching
+        # the playlist.
+        response.headers["Cache-Control"] = "no-store"
+        # Skips are otherwise invisible to the client (a shorter playlist).
+        response.headers["X-M3U-Channels-Included"] = str(included)
+        response.headers["X-M3U-Channels-Skipped"] = str(skipped)
+
+        return m3u_content
+
+    def generate_m3u_proxied_ts_all(self) -> str:
+        """
+        Public wrapper: TS-proxy M3U for all providers. Backs
+        "/api/m3u/proxied/ts". Deliberately UNCACHED — see
+        _generate_m3u_proxied_ts_content.
+        """
+        logger.info("Generating TS M3U playlist for all providers")
+        return self._serve_m3u_proxied_ts(None, "playlist_proxied_ts.m3u8")
+
+    def generate_m3u_proxied_ts_provider(self, provider: str) -> str:
+        """Public wrapper: TS-proxy M3U for a single provider.
+        Uncached — see generate_m3u_proxied_ts_all."""
+        logger.info(f"Generating TS M3U playlist for provider '{provider}'")
+        return self._serve_m3u_proxied_ts(provider, f"{provider}_proxied_ts_playlist.m3u8")
+
+    def generate_drm_directives(self, drm_configs) -> str:
+        """Public wrapper for DRM directive generation."""
+        return self._generate_drm_directives(drm_configs)
+
+    @staticmethod
+    def _process_license_headers(req_headers):
+        """
+        Process license headers and convert to URL-encoded format.
+
+        Args:
+            req_headers: Headers in various formats (dict, JSON string, query string)
+
+        Returns:
+            URL-encoded headers string
+        """
+        if isinstance(req_headers, str):
+            # Check if it's JSON format
+            if req_headers.strip().startswith("{"):
+                try:
+                    # Parse JSON and convert to URL-encoded
+                    headers_dict = json.loads(req_headers)
+                    return urlencode(headers_dict)
+                except json.JSONDecodeError:
+                    # If not JSON, try to parse as query string
+                    try:
+                        # parse_qsl can raise ValueError if the query string is malformed
+                        parsed_items = parse_qsl(req_headers)
+                        headers_dict = dict(parsed_items)
+                        return urlencode(headers_dict)
+                    except ValueError as val_err:
+                        logger.warning(
+                            f"Invalid query string format in headers: {val_err}"
+                        )
+                        return req_headers
+                    except Exception as parse_err:
+                        # Catch anything else unexpected
+                        logger.warning(f"Unexpected error parsing headers: {parse_err}")
+                        return req_headers
+            else:
+                # Assume it's already URL-encoded or query string format
+                try:
+                    headers_dict = dict(parse_qsl(req_headers))
+                    return urlencode(headers_dict)
+                except:
+                    return req_headers
+        elif isinstance(req_headers, dict):
+            # Convert dict to URL-encoded string
+            return urlencode(req_headers)
+        else:
+            logger.warning(f"Unsupported headers type: {type(req_headers)}")
+            return str(req_headers)
+
+    @staticmethod
+    def get_settings_manager():
+        """Simple helper to get SettingsManager"""
+        try:
+            from streaming_providers.base.settings.settings_manager import (
+                SettingsManager,
+            )
+
+            return SettingsManager()
+        except ImportError:
+            # Try alternative path
+            try:
+                from base.settings.settings_manager import SettingsManager
+
+                return SettingsManager()
+            except ImportError as e:
+                logger.error(f"Cannot import SettingsManager: {e}")
+                # Re-raise with a clearer message
+                raise ImportError(
+                    f"SettingsManager not available. Ensure streaming_providers module is installed. Error: {e}"
+                )
+
+    def setup_routes(self):
+        """Setup all routes from separate modules"""
+
+        # Add request logging hooks
+        @self.app.hook('before_request')
+        def log_request():
+            request._start_time = time.time()
+            logger.info(
+                f"→ {request.method} {request.path} from {request.remote_addr} (User-Agent: {request.headers.get('User-Agent', 'unknown')[:50]})")
+
+        @self.app.hook('after_request')
+        def log_response():
+            timing = request.environ.get("ultimate.timing")
+            timing_str = ", ".join(f"{n};dur={d:.1f}" for n, d in timing) if timing else ""
+            if timing_str and _SERVER_TIMING:
+                response.set_header("Server-Timing", timing_str)
+            logger.info(
+                f"← {request.method} {request.path} → {response.status_code} (took {time.time() - getattr(request, '_start_time', time.time()):.2f}s)"
+                + (f" [{timing_str}]" if timing_str else ""))
+
+        # CORS for browser clients (e.g. the Ultimate UI). Registered before the
+        # route modules so it covers every route. Read-only methods on purpose.
+        def _apply_cors_headers():
+            response.set_header("Access-Control-Allow-Origin", "*")
+            response.set_header("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS")
+            response.set_header(
+                "Access-Control-Allow-Headers", "Origin, Accept, Content-Type, Range"
+            )
+            response.set_header(
+                "Access-Control-Expose-Headers",
+                "Content-Length, Content-Range, X-Kodi-Drm-Configs, X-Kodi-Stream-Format",
+            )
+
+        @self.app.hook("after_request")
+        def enable_cors():
+            _apply_cors_headers()
+
+        # Bottle rebuilds the headers when it renders an HTTPError (abort(),
+        # 404, 500), which drops the hook's headers. Re-apply them there so the
+        # browser sees the real status instead of an opaque CORS failure.
+        _default_error_handler = self.app.default_error_handler
+
+        def _cors_error_handler(res):
+            _apply_cors_headers()
+            return _default_error_handler(res)
+
+        self.app.default_error_handler = _cors_error_handler
+
+        @self.app.route("/", method="OPTIONS")
+        @self.app.route("/<path:path>", method="OPTIONS")
+        def cors_preflight(path=None):
+            response.status = 204
+            response.set_header("Access-Control-Max-Age", "86400")
+            return ""
+
+        # Import route handlers here
+        from routes.providers import setup_provider_routes
+        from routes.streams import setup_stream_routes
+        from routes.m3u import setup_m3u_routes
+        from routes.drm import setup_drm_routes
+        from routes.cache import setup_cache_routes
+        from routes.config import setup_config_routes
+        from routes.epg import setup_epg_routes
+        from routes.events import setup_events_routes
+        from routes.vod import setup_vod_routes
+        from routes.recordings import setup_recordings_routes
+        from routes.timers import setup_timers_routes
+        from routes.bookmarks import setup_bookmarks_routes
+        from routes.favorites import setup_favorites_routes
+        from routes.docs import setup_docs_routes
+
+        # Setup routes from separate modules
+        setup_provider_routes(self.app, self.manager, self)
+        setup_stream_routes(self.app, self.manager, self)
+        setup_m3u_routes(self.app, self.manager, self)
+        setup_drm_routes(self.app, self.manager, self)
+        setup_cache_routes(self.app, self.manager, self)
+        setup_config_routes(self.app, self.manager, self)
+        setup_epg_routes(self.app, self.manager, self)
+        setup_events_routes(self.app, self.manager, self)
+        setup_vod_routes(self.app, self.manager)
+        setup_recordings_routes(self.app, self.manager, self)
+        setup_timers_routes(self.app, self.manager, self)
+        setup_bookmarks_routes(self.app, self.manager, self)
+        setup_favorites_routes(self.app, self.manager, self)
+        setup_docs_routes(self.app, self.manager, self)
+
+        # Core UI routes
+        @self.app.route("/config")
+        def serve_config_ui():
+            """Serve the web configuration interface"""
+            response.content_type = "text/html; charset=utf-8"
+            return self.config_html
+
+        @self.app.route("/")
+        def serve_root():
+            """Redirect root to config page"""
+            redirect("/config")
+
+        @self.app.route("/health")
+        def health():
+            """
+            Liveness probe for Docker/Unraid healthchecks. Deliberately touches
+            no provider, session or disk state, so it answers instantly even
+            while other requests are busy (e.g. an interactive login).
+            """
+            response.content_type = "application/json"
+            response.set_header("Cache-Control", "no-store")
+            return {"status": "ok"}
+
+
+class _ThreadingWSGIServer(ThreadingMixIn, WSGIServer):
+    """wsgiref server that handles each request in its own thread."""
+
+    daemon_threads = True  # don't block shutdown on in-flight requests
+    request_queue_size = 128  # socketserver default is 5
+
+
+class _QuietRequestHandler(WSGIRequestHandler):
+    def log_message(self, format, *args):  # noqa: A002
+        pass
+
+
+class ThreadedWSGIRefServer(ServerAdapter):
+    """
+    Bottle's default server ('wsgiref') is single-threaded: one slow request
+    (an interactive login, a long upstream call, a large proxied segment)
+    blocks every other request, including healthchecks, so an orchestrator
+    sees an unresponsive container and kills it. This adapter is the same
+    stdlib server with ThreadingMixIn, so it needs no extra dependency and
+    also works inside Kodi's Python.
+    """
+
+    def run(self, handler):
+        handler_cls = _QuietRequestHandler if self.quiet else WSGIRequestHandler
+        server = make_server(
+            self.host,
+            self.port,
+            handler,
+            server_class=_ThreadingWSGIServer,
+            handler_class=handler_cls,
+        )
+        try:
+            server.serve_forever()
+        finally:
+            server.server_close()
+
+
+def _install_sigterm_handler():
+    """
+    Turn SIGTERM (docker stop, systemd) into a normal exit so start_service's
+    finally block runs. Python's default SIGTERM action kills the process
+    without running it. No-op outside the main thread (e.g. Kodi mode).
+    """
+    if threading.current_thread() is not threading.main_thread():
+        return
+
+    def _handler(signum, frame):
+        raise SystemExit(0)
+
+    try:
+        signal.signal(signal.SIGTERM, _handler)
+    except (ValueError, OSError):
+        pass
+
+
+def start_service(service_instance):
+    """Start the Bottle server"""
+    port = service_instance.server_port
+    logger.info(f"Starting server on port {port}")
+
+    # Determine if we should run in debug mode
+    debug_mode = service_instance.env_manager.get_config("debug_mode", False)
+
+    # Preload channel lists in the background; the server below starts at once.
+    try:
+        service_instance.manager.warm_up()
+        service_instance.manager.start_auto_refresh()
+    except Exception as e:
+        logger.warning(f"Channel warm-up could not be started: {e}")
+
+    _install_sigterm_handler()
+
+    try:
+        run(
+            service_instance.app,
+            server=ThreadedWSGIRefServer,
+            host=os.environ.get("ULTIMATE_SERVER_HOST", "127.0.0.1"),
+            port=port,
+            quiet=not debug_mode,
+            debug=debug_mode,
+        )
+    finally:
+        service_instance.manager.stop_auto_refresh()
+        shutdown_emitter()  # flush queued analytics events (bounded, never raises)
+
+
+def run_kodi_service():
+    """Run service within Kodi addon context"""
+    logger.info("Starting Ultimate Backend service in Kodi mode")
+
+    try:
+        import xbmc
+        import xbmcaddon
+    except ImportError:
+        logger.error("Kodi modules not available!")
+        print("ERROR: Cannot run in Kodi mode - xbmc/xbmcaddon not available")
+        return
+
+    # Give Kodi time to initialize
+    time.sleep(3)
+
+    try:
+        # Create service instance
+        service = UltimateService()
+
+        # Start service in background thread
+        service_thread = threading.Thread(
+            target=start_service, args=(service,), name="UltimateBackendService"
+        )
+        service_thread.daemon = True
+        service_thread.start()
+
+        # Monitor for Kodi shutdown
+        monitor = xbmc.Monitor()
+        while not monitor.abortRequested():
+            if monitor.waitForAbort(5):
+                break
+
+        logger.info("Service stopped (Kodi shutdown)")
+    except Exception as e:
+        logger.error(f"Failed to start Kodi service: {e}")
+        raise
+
+
+def run_standalone_service(config_dir: str = None):
+    """Run service in standalone mode"""
+    logger.info("Starting Ultimate Backend service in standalone mode")
+
+    # Create service instance
+    service = UltimateService(config_dir=config_dir)
+
+    # Print startup information
+    print("=" * 60)
+    print("Ultimate Backend Streaming Service")
+    print("=" * 60)
+    print(f"Mode: Standalone")
+    print(f"Port: {service.server_port}")
+    print(f"Default Country: {service.default_country}")
+    print(f"Config Directory: {service.vfs.base_path}")
+    print(f"Log Directory: {service.env_manager.get_config('profile_path', 'N/A')}")
+    # External helpers are symmetric opt-ins (MEDIA_PROXY_URL / TS_PROXY_URL)
+    # — surface both at startup.
+    print(
+        f"Media Proxy: "
+        f"{service.media_proxy_url or 'disabled (MEDIA_PROXY_URL not set)'}"
+    )
+    print(
+        f"TS Proxy: "
+        f"{service.ts_proxy_url or 'disabled (TS_PROXY_URL not set)'}"
+    )
+    print("=" * 60)
+    print(f"API Endpoints:")
+    print(f"  http://localhost:{service.server_port}/api/providers")
+    print(f"  http://localhost:{service.server_port}/api/m3u")
+    print(f"  http://localhost:{service.server_port}/api/providers/<provider>/m3u")
+    print("=" * 60)
+    print("Press Ctrl+C to stop the service")
+    print("=" * 60)
+
+    try:
+        start_service(service)
+    except KeyboardInterrupt:
+        print("\nService stopped by user")
+    except Exception as e:
+        print(f"Error running service: {e}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Ultimate Backend Streaming Service")
+    parser.add_argument("--port", type=int, help="Server port (overrides config)")
+    parser.add_argument("--config-dir", help="Configuration directory")
+    parser.add_argument("--debug", action="store_true", help="Enable debug mode")
+    parser.add_argument(
+        "--kodi", action="store_true", help="Force Kodi mode (requires Kodi modules)"
+    )
+    parser.add_argument(
+        "--standalone", action="store_true", help="Force standalone mode"
+    )
+
+    args = parser.parse_args()
+
+    # Get environment manager
+    env_manager = get_environment_manager()
+
+    # Apply CLI overrides
+    if args.port:
+        env_manager.set_config("server_port", args.port)
+        logger.info(f"Port overridden via CLI: {args.port}")
+
+    if args.debug:
+        env_manager.set_config("debug_mode", True)
+        logger.info("Debug mode enabled via CLI")
+
+    # Determine execution mode
+    if args.kodi:
+        logger.info("Kodi mode forced by CLI argument")
+        run_kodi_service()
+    elif args.standalone:
+        logger.info("Standalone mode forced by CLI argument")
+        run_standalone_service(config_dir=args.config_dir)
+    elif is_kodi_environment():
+        logger.info("Kodi environment detected, running in Kodi mode")
+        run_kodi_service()
+    else:
+        logger.info("Running in standalone mode (default)")
+        run_standalone_service(config_dir=args.config_dir)

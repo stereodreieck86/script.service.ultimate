@@ -1,0 +1,628 @@
+# streaming_providers/providers/rtlplus/event_manager.py
+"""
+RTL+ Event Manager
+
+Handles fetching future/live events from Bedrock layout API.
+Uses the homepage's "Diese Live-Events erwarten euch" block as primary source.
+Follows non-sequential pagination (1 → 3 → 6 → ...) as returned by the API.
+
+Two-step manifest/DRM resolution for live events:
+  Step 1: Fetch folder layout  → find the live channel redirect (e.g. "rtlde_nitro" / "nitro")
+  Step 2: Fetch live layout    → extract video assets → pick best manifest / DRM config
+"""
+
+import json
+from datetime import datetime
+from typing import List, Optional, Dict, Set, Tuple
+
+from ...base.models.event import Event, EventStatus
+from ...base.utils.logger import logger
+from ...base.models import DRMConfig
+from .layout_helpers import unwrap_target, parse_german_datetime, extract_thumbnail
+
+
+class RTLPlusEventManager:
+    """
+    Manages fetching events (live streams, upcoming sports) for RTL+.
+
+    Uses the Bedrock layout API to fetch folder pages and paginated blocks.
+    Pagination follows the nextPage values exactly as returned by the API,
+    which may be non-sequential (1 → 3 → 6 → ...).
+    """
+
+    # Block titles that indicate live stream content
+    LIVE_STREAM_BLOCK_TITLES = [
+        "Diese Live-Events erwarten euch",  # Primary block on homepage
+        "Sport im Live-Stream",
+        "UEFA Europa & Conference League | Live",
+        "Live-Stream",
+        "Live Events",
+    ]
+
+    # Sport type mapping
+    SPORT_TYPES = {
+        "Fußball": "Football",
+        "Motorsport": "Motorsports",
+        "MMA": "MMA",
+        "NFL": "American Football",
+        "Europa League": "Football",
+        "Conference League": "Football",
+        "Bundesliga": "Football",
+    }
+
+    def __init__(self, provider):
+        self._provider = provider
+
+    @property
+    def cfg(self):
+        return self._provider.rtl_config
+
+    @property
+    def http(self):
+        return self._provider.http_manager
+
+    @property
+    def auth(self):
+        return self._provider.authenticator
+
+    # --------------------------------------------------------------------------
+    # Public API
+    # --------------------------------------------------------------------------
+
+    def get_events(
+            self,
+            folder_id: str = "6",
+            start_time: Optional[datetime] = None,
+            end_time: Optional[datetime] = None,
+            force_refresh: bool = False,
+            max_pages: int = 20,
+    ) -> List[Event]:
+        """
+        Fetch all future/live events.
+
+        Primary source is the homepage's "Diese Live-Events erwarten euch" block.
+        Falls back to specific folder if homepage fails.
+
+        Returns empty list if no events are found.
+        """
+        all_events: List[Event] = []
+
+        # PRIMARY: Fetch from homepage (has all events in one block)
+        try:
+            home_events = self._fetch_events_from_homepage(force_refresh, max_pages)
+            if home_events:
+                all_events.extend(home_events)
+                logger.info(f"Fetched {len(home_events)} events from homepage")
+        except Exception as e:
+            logger.warning(f"Failed to fetch events from homepage: {e}")
+
+        # If no events from homepage, try fallback
+        if not all_events:
+            try:
+                logger.debug(f"Falling back to folder {folder_id} for events")
+                layout = self._provider.fetch_layout(
+                    layout_type="folder",
+                    content_id=folder_id,
+                    force_refresh=force_refresh,
+                )
+                if layout:
+                    folder_events = self._extract_events_from_layout(layout)
+                    all_events.extend(folder_events)
+            except Exception as e:
+                logger.warning(f"Failed to fetch events from folder {folder_id}: {e}")
+
+        # Filter by time range
+        filtered_events = self._filter_by_time(all_events, start_time, end_time)
+
+        # Sort chronologically
+        filtered_events.sort(key=lambda e: e.start_time if e.start_time else datetime.max)
+
+        logger.info(f"Returning {len(filtered_events)} events after filtering")
+        return filtered_events
+
+    def get_manifest_for_event(self, event_id: str, drm_variant: str = "auto") -> Optional[str]:
+        """
+        Get manifest URL for an event using the two-step flow:
+
+          Step 1: Fetch the folder layout for ``event_id`` and locate the live
+                  channel redirect embedded in the "Jetzt live" block
+                  (value_layout.type == "live").
+          Step 2: Fetch the live layout for that channel and extract the best
+                  manifest URL from its video assets.
+
+        Falls back to direct asset extraction from the folder itself when no
+        live redirect is present (handles VOD-style event folders).
+
+        Args:
+            event_id: Folder ID for the event
+            drm_variant: 'auto', 'software', or 'hardware'
+        """
+        # --- Step 1: folder layout -------------------------------------------
+        folder_layout = self._provider.fetch_layout(
+            layout_type="folder",
+            content_id=event_id,
+        )
+        if not folder_layout:
+            logger.error(f"get_manifest_for_event: could not fetch folder layout for {event_id}")
+            return None
+
+        live_id, live_seo = self._extract_live_redirect(folder_layout)
+
+        if live_id:
+            logger.debug(
+                f"Event {event_id} -> live redirect: id={live_id}, seo={live_seo}"
+            )
+            # --- Step 2: live layout -----------------------------------------
+            manifest = self._manifest_from_live_layout(live_id, live_seo, drm_variant=drm_variant)
+            if manifest:
+                return manifest
+            logger.warning(
+                f"Event {event_id}: live layout for '{live_seo or live_id}' returned no manifest"
+            )
+
+        # Fallback: the folder itself may carry video assets (rare but possible)
+        assets = self._provider.extract_video_assets(folder_layout)
+        if assets:
+            manifest = self._provider.extract_best_manifest_url(assets, drm_variant=drm_variant)
+            if manifest:
+                logger.debug(f"Event {event_id}: manifest resolved from folder assets")
+                return manifest
+
+        logger.error(f"get_manifest_for_event: no manifest found for event {event_id}")
+        return None
+
+    def get_drm_for_event(self, event_id: str, drm_variant: str = "auto") -> List[DRMConfig]:
+        """
+        Get DRM configuration for an event using the two-step flow:
+
+          Step 1: Fetch the folder layout for ``event_id`` and locate the live
+                  channel redirect embedded in the "Jetzt live" block
+                  (value_layout.type == "live").
+          Step 2: Fetch the live layout for that channel and extract DRM config
+                  from its video assets.
+
+        Falls back to direct DRM extraction from the folder layout when no live
+        redirect is found (handles VOD-style event folders).
+
+        Args:
+            event_id: Folder ID for the event
+            drm_variant: 'auto', 'software', or 'hardware'
+        """
+        # --- Step 1: folder layout -------------------------------------------
+        folder_layout = self._provider.fetch_layout(
+            layout_type="folder",
+            content_id=event_id,
+        )
+        if not folder_layout:
+            logger.error(f"get_drm_for_event: could not fetch folder layout for {event_id}")
+            return []
+
+        live_id, live_seo = self._extract_live_redirect(folder_layout)
+
+        if live_id:
+            logger.debug(
+                f"Event {event_id} -> live redirect: id={live_id}, seo={live_seo}"
+            )
+            # --- Step 2: live layout -----------------------------------------
+            drm_configs = self._drm_from_live_layout(live_id, live_seo, drm_variant=drm_variant)
+            if drm_configs:
+                return drm_configs
+            logger.warning(
+                f"Event {event_id}: live layout for '{live_seo or live_id}' returned no DRM"
+            )
+
+        # Fallback: try extracting DRM directly from the folder layout
+        drm_configs = self._provider.get_drm_for_content(folder_layout, drm_variant=drm_variant)
+        if drm_configs:
+            logger.debug(f"Event {event_id}: DRM resolved from folder assets")
+            return drm_configs
+
+        logger.error(f"get_drm_for_event: no DRM config found for event {event_id}")
+        return []
+
+    # --------------------------------------------------------------------------
+    # Two-step helpers
+    # --------------------------------------------------------------------------
+
+    @staticmethod
+    def _extract_live_redirect(folder_layout: Dict) -> Tuple[Optional[str], Optional[str]]:
+        """
+        Scan a folder layout and return the first live-channel redirect found.
+
+        Returns ``(channel_id, channel_seo)`` – e.g. ``("rtlde_nitro", "nitro")``.
+        Both values are ``None`` when no live redirect is present.
+
+        The redirect lives in bffPaginated blocks as an item whose action target
+        has ``value_layout.type == "live"``.  Both "classic" items (the "Jetzt
+        live" programme card shown in the folder) and "video" items (the inline
+        player block) are checked so the method works for both folder shapes
+        encountered in the wild.
+        """
+        for block in folder_layout.get("blocks", []):
+            if block.get("type") != "bffPaginated":
+                continue
+
+            for item in block.get("content", {}).get("items", []):
+                item_content = item.get("itemContent", {})
+
+                # Both classic and video items carry the redirect in action.target
+                action = item_content.get("action", {})
+                target = unwrap_target(action.get("target", {}))
+                value_layout = target.get("value_layout", {})
+
+                if value_layout.get("type") == "live":
+                    channel_id = value_layout.get("id")    # e.g. "rtlde_nitro"
+                    channel_seo = value_layout.get("seo")  # e.g. "nitro"
+                    if channel_id:
+                        return channel_id, channel_seo
+
+        return None, None
+
+    def _manifest_from_live_layout(
+            self,
+            channel_id: str,
+            channel_seo: Optional[str] = None,
+            drm_variant: str = "auto",
+    ) -> Optional[str]:
+        path_id = (
+                channel_seo
+                or self._provider.channel_manager._normalize_channel_identifier(channel_id)
+        )
+        location = f"{self.cfg.base_website}{path_id}/live"
+
+        live_layout = self._provider.fetch_layout(
+            layout_type="live",
+            content_id=path_id,
+            location=location,
+        )
+        if not live_layout:
+            logger.warning(f"_manifest_from_live_layout: no live layout returned for '{path_id}'")
+            return None
+
+        assets = self._provider.extract_video_assets(live_layout)
+        if not assets:
+            logger.warning(
+                f"_manifest_from_live_layout: no video assets in live layout for '{path_id}'"
+            )
+            return None
+
+        return self._provider.extract_best_manifest_url(assets, drm_variant=drm_variant)
+
+    def _drm_from_live_layout(
+            self,
+            channel_id: str,
+            channel_seo: Optional[str] = None,
+            drm_variant: str = "auto",
+    ) -> List[DRMConfig]:
+        """
+        Step 2 for DRM: fetch the live layout and extract DRM configuration.
+
+        Uses the same SEO-slug normalisation as ``_manifest_from_live_layout``.
+        """
+        path_id = (
+            channel_seo
+            or self._provider.channel_manager._normalize_channel_identifier(channel_id)
+        )
+        location = f"{self.cfg.base_website}{path_id}/live"
+
+        live_layout = self._provider.fetch_layout(
+            layout_type="live",
+            content_id=path_id,
+            location=location,
+        )
+        if not live_layout:
+            logger.warning(f"_drm_from_live_layout: no live layout returned for '{path_id}'")
+            return []
+
+        return self._provider.get_drm_for_content(live_layout, drm_variant=drm_variant)
+
+    # --------------------------------------------------------------------------
+    # Homepage Event Fetching (Primary Source)
+    # --------------------------------------------------------------------------
+
+    def _fetch_events_from_homepage(
+            self, force_refresh: bool = False, max_pages: int = 20
+    ) -> List[Event]:
+        """
+        Fetch events from the homepage's "Diese Live-Events erwarten euch" block.
+
+        This is the primary source because it contains ALL live events in one
+        paginated block, unlike folder views which only show one event.
+
+        Pagination follows the nextPage values exactly as returned by the API.
+        The API uses non-sequential page numbers (1 → 3 → 6 → ...).
+        """
+        home_layout = self._provider.fetch_layout(
+            layout_type="alias",
+            content_id="home",
+            location=f"{self._provider.rtl_config.base_website}",
+            force_refresh=force_refresh,
+        )
+
+        if not home_layout:
+            logger.warning("Failed to fetch home layout for events")
+            return []
+
+        live_block = self._find_live_events_block(home_layout)
+        if not live_block:
+            logger.debug("No live events block found on homepage")
+            return []
+
+        block_id = live_block.get("id")
+        if not block_id:
+            logger.warning("Live events block missing 'id' field")
+            return []
+
+        all_events: List[Event] = []
+        # visited_pages guards against an infinite loop if the API ever returns
+        # a nextPage value that points back to a page we already fetched.
+        visited_pages: Set[int] = set()
+
+        # Process first page (already loaded in home_layout)
+        initial_items = live_block.get("content", {}).get("items", [])
+        all_events.extend(self._extract_events_from_items(initial_items))
+        visited_pages.add(1)
+
+        # Get pagination info from first page
+        pagination = live_block.get("content", {}).get("pagination", {})
+        next_page = pagination.get("nextPage")  # Will be 3, not 2!
+        pages_fetched = 1
+
+        logger.debug(
+            f"Live events block: total={pagination.get('totalItems', 0)}, next_page={next_page}"
+        )
+
+        # Follow nextPage links exactly as returned by API.
+        # The API skips many page numbers (e.g. 1 → 3 → 6 → 9), so we must
+        # never assume the next page number — always use the value from the
+        # pagination response.
+        while next_page and next_page not in visited_pages and pages_fetched < max_pages:
+            visited_pages.add(next_page)
+            logger.debug(f"Fetching page {next_page} of live events block")
+
+            page_data = self._provider.fetch_block_page(
+                block_id=block_id,
+                page=next_page,
+                nb_pages=3,
+                service_id="rtlplus_root",
+            )
+
+            if not page_data:
+                logger.warning(f"Failed to fetch page {next_page} for block {block_id}")
+                break
+
+            items = page_data.get("content", {}).get("items", [])
+            all_events.extend(self._extract_events_from_items(items))
+            pages_fetched += 1
+
+            pagination = page_data.get("content", {}).get("pagination", {})
+            next_page = pagination.get("nextPage")
+
+        logger.info(f"Fetched {len(all_events)} events from {pages_fetched} pages")
+        return all_events
+
+    def _find_live_events_block(self, layout: Dict) -> Optional[Dict]:
+        """
+        Find the live events block in homepage layout.
+
+        Prefers an exact match on "Diese Live-Events erwarten euch", then
+        falls back to any block whose title contains a known pattern.
+        """
+        fallback: Optional[Dict] = None
+
+        for block in layout.get("blocks", []):
+            if block.get("type") != "bffPaginated":
+                continue
+
+            # Get block_title safely - it might be None
+            block_title = None
+            analytics = block.get("analytics", {})
+            if analytics:
+                tealium = analytics.get("tealium", {})
+                if tealium:
+                    block_title = tealium.get("block_title")
+
+            if block_title is None:
+                continue
+
+            # Exact match — return immediately
+            if block_title.strip() == "Diese Live-Events erwarten euch":
+                logger.debug(f"Found live events block (exact): '{block_title}'")
+                return block
+
+            # Partial match — keep as fallback, continue looking for exact
+            if fallback is None:
+                for pattern in self.LIVE_STREAM_BLOCK_TITLES:
+                    if pattern.lower() in block_title.lower():
+                        logger.debug(f"Found potential live block (partial): '{block_title}'")
+                        fallback = block
+                        break
+
+        return fallback
+
+    # --------------------------------------------------------------------------
+    # Layout Extraction Helpers
+    # --------------------------------------------------------------------------
+
+    def _extract_events_from_layout(self, layout: Dict) -> List[Event]:
+        """Extract events from any layout by scanning all bffPaginated blocks."""
+        all_events: List[Event] = []
+
+        for block in layout.get("blocks", []):
+            if block.get("type") != "bffPaginated":
+                continue
+
+            items = block.get("content", {}).get("items", [])
+            all_events.extend(self._extract_events_from_items(items))
+
+        return all_events
+
+    # --------------------------------------------------------------------------
+    # Event Extraction from Items
+    # --------------------------------------------------------------------------
+
+    def _extract_events_from_items(self, items: List[Dict]) -> List[Event]:
+        """
+        Extract Event objects from block items.
+
+        Each item represents a live event with:
+        - highlight: "Fußball • Do., 07.05.26, 20:30 Uhr"
+        - action.target.value_layout: contains folder_id for the event
+        """
+        events: List[Event] = []
+
+        for item in items:
+            if item.get("itemType") != "classic":
+                continue
+
+            item_content = item.get("itemContent", {})
+            highlight = item_content.get("highlight", "")
+
+            if not highlight:
+                continue
+
+            # Parse the date from highlight, falling back to description
+            event_date = parse_german_datetime(highlight)
+            if not event_date:
+                description = item_content.get("description", "")
+                if description:
+                    event_date = parse_german_datetime(description)
+            if not event_date:
+                continue
+
+            # Determine status early so we can decide whether to keep the event
+            status = self._determine_event_status(event_date, highlight)
+
+            # Exclude events that have already ended (not live and started > 3 h ago)
+            if status == EventStatus.ENDED:
+                continue
+
+            # Extract title
+            title = item_content.get("title") or self._extract_title_from_highlight(highlight)
+            if not title:
+                title = "Unknown Event"
+
+            # Unwrap the action target (handles lock-wrapped targets transparently)
+            action = item_content.get("action", {})
+            target = unwrap_target(action.get("target", {}))
+            value_layout = target.get("value_layout", {})
+            folder_id = value_layout.get("id")
+
+            # Fallback to itemContent.id if folder_id not found
+            if not folder_id:
+                folder_id = item_content.get("id")
+
+            if not folder_id:
+                logger.debug(f"Skipping event with no folder_id: {title}")
+                continue
+
+            sport = self._extract_sport_type(highlight)
+
+            event = Event(
+                name=title,
+                content_id=folder_id,
+                provider=self._provider.provider_name,
+                start_time=event_date,
+                end_time=None,  # End time not provided in this response
+                status=status,
+                logo_url=extract_thumbnail(item_content),
+                genre=sport,
+                venue=item_content.get("details") or item_content.get("extraDetails"),
+                description=item_content.get("description"),
+            )
+
+            # Store additional metadata for later manifest resolution
+            event.manifest_script = json.dumps({
+                "folder_id": folder_id,
+                "seo": value_layout.get("seo"),
+                "highlight": highlight,
+                "title": title,
+            })
+
+            events.append(event)
+
+        return events
+
+    # --------------------------------------------------------------------------
+    # Date / Status / Sport Helpers
+    # --------------------------------------------------------------------------
+
+    @staticmethod
+    def _determine_event_status(event_date: datetime, highlight: str) -> EventStatus:
+        """
+        Determine if event is live, upcoming, or ended.
+
+        Uses both the date/time and the presence of "Live" in the highlight text.
+        """
+        now = datetime.now()
+
+        # Explicit "Live" label in the metadata takes priority
+        if "live" in highlight.lower():
+            return EventStatus.LIVE
+
+        # Event started within the last 3 hours → treat as live
+        if event_date <= now:
+            return EventStatus.LIVE
+
+        if event_date > now:
+            return EventStatus.SCHEDULED
+
+        return EventStatus.ENDED
+
+    @staticmethod
+    def _extract_title_from_highlight(highlight: str) -> str:
+        """Extract event title from highlight text when no separate title exists."""
+        import re
+        parts = highlight.split("•")
+        if len(parts) >= 2:
+            middle = parts[1].strip()
+            date_match = re.search(r"\d{2}\.\d{2}\.\d{2}", middle)
+            if date_match:
+                title = middle[:date_match.start()].strip()
+                if title:
+                    return title
+        return highlight
+
+    def _extract_sport_type(self, highlight: str) -> str:
+        """Extract sport type from highlight."""
+        sport_part = highlight.split("•")[0].strip()
+        for german, english in self.SPORT_TYPES.items():
+            if german in sport_part:
+                return english
+        return sport_part or "Sport"
+
+    # --------------------------------------------------------------------------
+    # Time Filtering
+    # --------------------------------------------------------------------------
+
+    @staticmethod
+    def _filter_by_time(
+        events: List[Event],
+        start_time: Optional[datetime],
+        end_time: Optional[datetime],
+    ) -> List[Event]:
+        """Filter events by time range."""
+        if not start_time and not end_time:
+            return events
+
+        filtered = []
+        for event in events:
+            if start_time and event.start_time and event.start_time < start_time:
+                continue
+            if end_time and event.start_time and event.start_time > end_time:
+                continue
+            filtered.append(event)
+
+        return filtered
+
+    # --------------------------------------------------------------------------
+    # Cache Management
+    # --------------------------------------------------------------------------
+
+    def invalidate_cache(self, folder_id: Optional[str] = None):
+        """Invalidate the layout cache."""
+        if folder_id:
+            cache_key = f"folder:{folder_id}:1:2"
+            self._provider.invalidate_layout_cache(cache_key)
+        else:
+            self._provider.invalidate_layout_cache()

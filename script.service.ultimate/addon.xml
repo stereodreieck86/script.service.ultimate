@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<addon id="script.service.ultimate" name="Ultimate Backend" version="1.0.5" provider-name="Nirvana">
+  <requires>
+    <import addon="xbmc.python" version="3.0.0"/>
+    <import addon="script.module.bottle" version="0.12.25"/>
+    <import addon="script.module.requests" version="2.25.1"/>
+    <import addon="script.module.pycryptodome" version="3.4.3"/>
+    <import addon="script.module.urllib3" version="1.25.3"/>
+    <import addon="script.module.qrcode"/>
+  </requires>
+
+  <extension point="xbmc.python.script" library="service.py">
+    <provides>executable</provides>
+  </extension>
+
+  <extension point="xbmc.service"/>
+
+  <extension point="xbmc.addon.metadata">
+    <summary>Backend service for streaming providers integration</summary>
+    <description>
+      Ultimate Backend provides a local API service that bridges Kodi with popular streaming providers.
+
+      Features:
+      • Live TV streaming from Joyn (DE/AT/CH) and RTL+
+      • DASH manifest rewriting for seamless playback
+      • DRM support (Widevine, PlayReady, ClearKey)
+      • M3U playlist generation for PVR IPTV Simple Client
+      • Provider-specific proxy configuration
+      • Caching system for improved performance
+
+      This service runs in the background and enables live TV channels from streaming platforms
+      to appear directly in Kodi's TV section with full PVR integration.
+    </description>
+    <platform>all</platform>
+    <license>GPL-3.0</license>
+    <forum>https://example.com/forum</forum>
+    <website>https://example.com</website>
+    <email>support@example.com</email>
+    <source>https://github.com/nirvana-7777/script.service.ultimate</source>
+    <language>en</language>
+
+    <news>
+- v1.0.0: Initial release
+- Support for Joyn DE, AT, CH and RTL+
+- Manifest proxying and DRM handling
+- M3U playlist generation for PVR IPTV Simple
+- Provider-specific proxy configuration
+    </news>
+    <source>https://github.com/nirvana-7777/script.service.ultimate</source>
+    <assets>
+      <icon>icon.png</icon>
+      <fanart>fanart.jpg</fanart>
+    </assets>
+  </extension>
+</addon>

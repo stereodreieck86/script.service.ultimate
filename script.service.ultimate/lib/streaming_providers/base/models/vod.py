@@ -1,0 +1,356 @@
+# streaming_providers/base/models/vod.py
+
+import re
+import unicodedata
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional
+
+from .content import Content, StreamingMode, ContentType
+from ..utils.logger import logger
+
+
+# ---------------------------------------------------------------------------
+# Slug utilities (defensive)
+# ---------------------------------------------------------------------------
+
+def slugify(text: Optional[str]) -> str:
+    """
+    Convert an arbitrary string to a URL-safe slug.
+
+    Args:
+        text: String to slugify (can be None)
+
+    Returns:
+        Slugified string or empty string if text is None/empty
+    """
+    # Defensive: handle None or empty input
+    if not text:
+        logger.debug("slugify called with None or empty text, returning empty string")
+        return ""
+
+    try:
+        # 1. Normalise unicode
+        text = unicodedata.normalize("NFKD", text)
+        text = "".join(c for c in text if not unicodedata.combining(c))
+        # 2. Lowercase
+        text = text.lower()
+        # 3. Whitespace / separators → underscore
+        text = re.sub(r"[\s\-–—/\\|]+", "_", text)
+        # 4. Keep only safe characters
+        text = re.sub(r"[^\w\-_]", "", text)
+        # 5. Collapse runs
+        text = re.sub(r"_+", "_", text)
+        # 6. Strip edges
+        return text.strip("_-")
+    except Exception as e:
+        logger.warning(f"Error slugifying text '{text}': {e}, returning empty string")
+        return ""
+
+
+def build_slug_map(entries: list) -> Dict[str, str]:
+    """
+    Build a slug -> content_id mapping for a list of VodCategory / VodItem
+    entries, falling back to the content_id itself as the slug when two
+    siblings would produce the same slug.
+
+    Returns:
+        {slug: content_id}
+    """
+    # First pass: compute preferred slug for every entry
+    preferred: List[tuple] = []
+    for entry in entries:
+        if not hasattr(entry, 'name') or not entry.name:
+            logger.warning(f"Entry missing name: {entry}")
+            continue
+        preferred.append((slugify(entry.name), entry.content_id))
+
+    # Detect collisions
+    seen_slugs: Dict[str, int] = {}
+    for slug, _ in preferred:
+        if slug:  # Only count non-empty slugs
+            seen_slugs[slug] = seen_slugs.get(slug, 0) + 1
+
+    slug_map: Dict[str, str] = {}
+    for slug, content_id in preferred:
+        if not slug:
+            # If slug is empty, use content_id directly
+            final_slug = slugify(content_id) or content_id
+            slug_map[final_slug] = content_id
+        elif seen_slugs.get(slug, 0) > 1:
+            # Fall back to the raw ID as the slug
+            final_slug = slugify(content_id) or content_id
+            logger.debug(
+                f"VOD slug collision for '{slug}' — using id '{final_slug}' instead"
+            )
+            slug_map[final_slug] = content_id
+        else:
+            slug_map[slug] = content_id
+
+    return slug_map
+
+
+# ---------------------------------------------------------------------------
+# VodCategory
+# ---------------------------------------------------------------------------
+
+@dataclass
+class VodCategory:
+    """
+    A browsable VOD node — category, collection, series, season, etc.
+
+    Not playable. Resolved by calling provider.get_vod_category(path_ids).
+    content_id is used as the path segment ID when navigating deeper.
+    """
+
+    # Required
+    name: str
+    content_id: str
+    provider: str
+
+    # Optional metadata
+    logo_url: Optional[str] = None
+    description: Optional[str] = None
+
+    # Hint about how many children this node has (may be None if unknown)
+    child_count: Optional[int] = None
+
+    # Full API href this category was derived from (e.g. showAllUrl or details.href).
+    # Stored for convenience / debugging; the content_id already encodes the path.
+    details_url: Optional[str] = None
+
+    # Full URL to use when fetching this category's children, including any
+    # portal-scoping query params (e.g. ?whiteLabelId=megathek).  When present,
+    # get_vod_category / _fetch_lane_items should use this URL directly instead
+    # of reconstructing it from content_id, which loses query params.
+    fetch_url: Optional[str] = None
+
+    # Cached slug (computed lazily). init=False / compare=False: it is a
+    # cache, not state -- two equal categories must compare equal whether or
+    # not .slug was accessed, and it must not be an __init__ parameter.
+    _slug: Optional[str] = field(default=None, init=False, repr=False, compare=False)
+
+    def __post_init__(self):
+        """Validate and clean up required fields."""
+        # Defensive: ensure name is a valid string
+        if not isinstance(self.name, str) or not self.name.strip():
+            logger.warning(f"VodCategory created with invalid name for content_id {self.content_id}")
+            self.name = f"Unbenannt_{self.content_id}"
+
+        # Ensure content_id is valid
+        if not self.content_id:
+            raise ValueError("VodCategory requires content_id")
+
+        # Ensure provider is valid
+        if not self.provider:
+            raise ValueError("VodCategory requires provider")
+
+    @property
+    def slug(self) -> str:
+        if not self._slug:
+            self._slug = slugify(self.name)
+            # If slugify returns empty (e.g., for non-Latin names), use a fallback
+            if not self._slug:
+                self._slug = slugify(self.content_id) or self.content_id
+        return self._slug
+
+    @property
+    def node_type(self) -> str:
+        return "vod_category"
+
+    def to_dict(self) -> Dict:
+        return {
+            "type": self.node_type,
+            "id": self.content_id,
+            "name": self.name,
+            "slug": self.slug,
+            "provider": self.provider,
+            "logo_url": self.logo_url,
+            "description": self.description,
+            "child_count": self.child_count,
+            "details_url": self.details_url,
+            "fetch_url": self.fetch_url,
+        }
+
+
+# ---------------------------------------------------------------------------
+# VodItem
+# ---------------------------------------------------------------------------
+
+@dataclass
+class VodItem(Content):
+    """
+    A playable VOD leaf — movie, episode, documentary, past sports event, etc.
+
+    Inherits all streaming/DRM fields from Content.
+    Manifest and DRM are resolved identically to channels and events:
+        provider.get_manifest(content_id)
+        provider.get_drm(content_id)
+    """
+
+    # Timing
+    duration_seconds: Optional[int] = None
+    release_year: Optional[int] = None
+
+    # Classification
+    rating: Optional[str] = None  # e.g. "FSK 12", "PG-13", "TV-MA"
+    genre: Optional[str] = None  # primary genre (mainGenre)
+    genres: Optional[List[str]] = None  # full genre list
+
+    # Extended descriptions
+    # description (short) is inherited from Content
+    long_description: Optional[str] = None  # longDescription from contentInformation
+    original_title: Optional[str] = None  # originalTitle — important for localised content
+
+    # People
+    cast: Optional[List[str]] = None
+    director: Optional[str] = None
+
+    # Series / episode context (None for standalone movies / documentaries)
+    season_number: Optional[int] = None
+    episode_number: Optional[int] = None
+    # Back-references for episodes — lets the UI navigate up without re-parsing IDs
+    series_id: Optional[str] = None  # e.g. "GN_SERIES_184925"
+    series_title: Optional[str] = None  # e.g. "Two and a Half Men"
+
+    # Promotional
+    trailer_url: Optional[str] = None
+
+    # Content classification
+    # True  → short highlight/clip reel (videoType == "CLIP")
+    # False → full broadcast recording  (videoType == "STANDALONE_EVENT" etc.)
+    is_highlight: bool = False
+
+    # Cached slug (see VodCategory._slug)
+    _slug: Optional[str] = field(default=None, init=False, repr=False, compare=False)
+
+    def __post_init__(self):
+        """Validate and clean up required fields."""
+        # Defensive: ensure name is a valid string
+        if not isinstance(self.name, str) or not self.name.strip():
+            logger.warning(f"VodItem created with invalid name for content_id {self.content_id}")
+            self.name = f"Unbenanntes Video_{self.content_id}"
+
+        # Ensure mode and content_type are set correctly for on-demand content
+        if self.mode == StreamingMode.LIVE:
+            self.mode = StreamingMode.VOD
+        if self.content_type == ContentType.LIVE:
+            self.content_type = ContentType.VOD
+
+        # Defensive: handle negative season/episode numbers
+        if self.season_number is not None and self.season_number < 0:
+            self.season_number = None
+        if self.episode_number is not None and self.episode_number < 0:
+            self.episode_number = None
+
+        # 🔥 CRITICAL: Call parent __post_init__ to validate Pricing vs Mode!
+        super().__post_init__()
+
+    @property
+    def slug(self) -> str:
+        if not self._slug:
+            self._slug = slugify(self.name)
+            # If slugify returns empty, use a fallback
+            if not self._slug:
+                self._slug = slugify(self.content_id) or self.content_id
+        return self._slug
+
+    @property
+    def node_type(self) -> str:
+        return "vod"
+
+    @property
+    def is_episode(self) -> bool:
+        return self.season_number is not None or self.episode_number is not None
+
+    @property
+    def duration_minutes(self) -> Optional[int]:
+        if self.duration_seconds is not None:
+            return self.duration_seconds // 60
+        return None
+
+    def to_dict(self) -> Dict:
+        result = super().to_dict()
+        result.update({
+            "type": self.node_type,
+            "slug": self.slug,
+            "is_highlight": self.is_highlight,
+            "duration_seconds": self.duration_seconds,
+            "duration_minutes": self.duration_minutes,
+            "release_year": self.release_year,
+            "rating": self.rating,
+            "genre": self.genre,
+            "genres": self.genres,
+            "long_description": self.long_description,
+            "original_title": self.original_title,
+            "cast": self.cast,
+            "director": self.director,
+            "season_number": self.season_number,
+            "episode_number": self.episode_number,
+            "series_id": self.series_id,
+            "series_title": self.series_title,
+            "trailer_url": self.trailer_url,
+        })
+        return result
+
+    def validate(self) -> List[str]:
+        warnings = []
+        if not self.manifest and not self.manifest_script:
+            warnings.append("No manifest URL or manifest script provided")
+        if self.license_url and not self.drm_config:
+            warnings.append("License URL provided but no DRM configuration")
+        if self.duration_seconds is not None and self.duration_seconds <= 0:
+            warnings.append("duration_seconds must be positive")
+        if self.release_year is not None and not (1888 <= self.release_year <= 2100):
+            warnings.append(f"Unusual release_year: {self.release_year}")
+        if not self.name:
+            warnings.append("Name is empty or None")
+        if not self.content_id:
+            warnings.append("Content ID is empty or None")
+        return warnings
+
+    # Factory methods
+    @classmethod
+    def create_movie(
+            cls, name: Optional[str], content_id: str, provider: str, **kwargs
+    ) -> "VodItem":
+        # Defensive: ensure name is string
+        if not isinstance(name, str) or not name:
+            name = f"Film_{content_id}"
+        return cls(
+            name=name,
+            content_id=content_id,
+            provider=provider,
+            mode=StreamingMode.VOD,
+            content_type=ContentType.MOVIE,
+            **kwargs,
+        )
+
+    @classmethod
+    def create_episode(
+            cls,
+            name: Optional[str],
+            content_id: str,
+            provider: str,
+            season_number: Optional[int],
+            episode_number: Optional[int],
+            **kwargs,
+    ) -> "VodItem":
+        # Defensive: ensure name is string
+        if not isinstance(name, str) or not name:
+            name = f"Episode_{content_id}"
+        # Defensive: handle negative season/episode numbers
+        if season_number is not None and season_number < 0:
+            season_number = None
+        if episode_number is not None and episode_number < 0:
+            episode_number = None
+
+        return cls(
+            name=name,
+            content_id=content_id,
+            provider=provider,
+            mode=StreamingMode.VOD,
+            content_type=ContentType.SERIES,
+            season_number=season_number,
+            episode_number=episode_number,
+            **kwargs,
+        )

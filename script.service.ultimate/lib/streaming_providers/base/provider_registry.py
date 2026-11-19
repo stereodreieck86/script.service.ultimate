@@ -1,0 +1,522 @@
+# streaming_providers/base/provider_registry.py
+"""
+Core provider registry handling discovery, metadata, and lifecycle management.
+"""
+
+import threading
+from typing import Any, Dict, List, Optional
+
+from .provider import StreamingProvider
+from .utils.logger import logger
+
+_CAPABILITY_NAMES = (
+    "channels", "vod", "epg", "recordings", "favorites", "bookmarks",
+    "catchup", "drm",
+)
+
+
+def _collect_capabilities(instance: Optional[StreamingProvider]) -> Optional[Dict[str, bool]]:
+    """
+    Read the derived ``implements_*`` flags of a live provider instance.
+
+    Capabilities are instance-level (they come from which managers the
+    provider wired), so they are only known once the provider exists, i.e.
+    for ENABLED providers. Returns None when there is no instance or the
+    provider exposes no boolean flags (e.g. an old-style provider).
+    """
+    if instance is None:
+        return None
+    caps: Dict[str, bool] = {}
+    for name in _CAPABILITY_NAMES:
+        try:
+            value = getattr(instance, f"implements_{name}")
+        except Exception:  # a property may raise on a half-built provider
+            continue
+        if isinstance(value, bool):
+            caps[name] = value
+    return caps or None
+
+
+class ProviderMetadata:
+    """Metadata for a provider instance with lazy initialization."""
+
+    def __init__(
+        self,
+        plugin_class,
+        country: str,
+        enabled: bool = False,
+        instance_name: Optional[str] = None,
+    ):
+        self.plugin_class = plugin_class
+        self.country = country.lower()
+        self.enabled = enabled
+        self.instance: Optional[StreamingProvider] = None
+        # The registry key this metadata is stored under. When given, it
+        # becomes ``name`` so to_dict()["name"] always resolves in
+        # get_provider(); otherwise the name is derived from the class name
+        # and the two can drift apart.
+        self._instance_name = instance_name
+        # Guards lazy create/destroy: two threads asking for the same
+        # provider must not build (and authenticate) two instances.
+        self._lock = threading.RLock()
+        self._extract_metadata()
+
+    def _extract_metadata(self):
+        """Extract static metadata from provider class without instantiation"""
+        self.plugin_name = self.plugin_class.get_plugin_key()
+
+        # Check if provider supports multiple countries
+        supports_multiple = self.plugin_class.supports_multiple_countries()
+
+        if supports_multiple:
+            # Multi-country provider: include country in name
+            self.name = f"{self.plugin_name}_{self.country}"
+            self.is_multi_country = True
+        else:
+            # Single-country provider
+            self.name = self.plugin_name
+
+            # Check if provider has an explicit single country
+            supported_countries = self.plugin_class.get_static_supported_countries()
+            if len(supported_countries) == 1:
+                # Provider has exactly one supported country (e.g., HRTi with ["HR"])
+                # Use that country instead of the passed-in country
+                self.country = supported_countries[0]
+                self.is_multi_country = False
+            else:
+                # True single-country or country-agnostic (empty list)
+                self.is_multi_country = False
+
+        # Rest of the method remains the same...
+        self.label = self.plugin_class.get_static_label(self.country)
+        self.supported_auth_types = self.plugin_class.get_static_auth_types()
+        self.logo = self.plugin_class.get_static_logo(self.country)
+        self.supported_countries = self.plugin_class.get_static_supported_countries()
+        self.requires_credentials = any(
+            auth_type in ["user_credentials", "client_credentials"]
+            for auth_type in self.supported_auth_types
+        )
+
+        if self._instance_name:
+            self.name = self._instance_name
+
+    def create_instance(self) -> Optional[StreamingProvider]:
+        """Lazily create provider instance if enabled"""
+        if not self.enabled:
+            return None
+
+        with self._lock:
+            if self.instance is None:
+                try:
+                    logger.info(f"Creating instance for provider: {self.name}")
+                    self.instance = self.plugin_class(country=self.country)
+                    logger.debug(f"Successfully created instance for {self.name}")
+                except Exception:
+                    # logger.exception keeps the traceback: a missing
+                    # provider_name, a bad manager wiring (ConfigurationError)
+                    # or an import error otherwise shows up as one cryptic
+                    # line and the provider silently vanishes from the UI.
+                    logger.exception(f"Failed to create instance for {self.name}")
+                    self.instance = None
+
+            return self.instance
+
+    def destroy_instance(self):
+        """Clean up provider instance"""
+        with self._lock:
+            if self.instance:
+                logger.debug(f"Destroying instance for provider: {self.name}")
+                self.instance = None
+
+    def set_enabled(self, enabled: bool):
+        """Update enabled status and manage instance accordingly"""
+        self.enabled = enabled
+        if enabled and self.instance is None:
+            self.create_instance()
+        elif not enabled and self.instance is not None:
+            self.destroy_instance()
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert metadata to dictionary for API response"""
+        return {
+            "name": self.name,
+            "label": self.label,
+            "plugin": self.plugin_name,
+            "country": self.country.upper(),
+            "enabled": self.enabled,
+            "instance_ready": self.instance is not None,
+            "requires_credentials": self.requires_credentials,
+            "supported_auth_types": self.supported_auth_types,
+            "logo": self.logo,
+            "is_multi_country": self.is_multi_country,
+            "supported_countries": self.supported_countries,
+            "capabilities": _collect_capabilities(self.instance),
+        }
+
+
+class M3UGroupMetadata:
+    """
+    Specialized metadata for M3U group-based providers.
+
+    NOW SUPPORTS LAZY INITIALIZATION like regular ProviderMetadata.
+    This ensures M3U providers get proper proxy configuration.
+    """
+
+    def __init__(self, plugin_class, group: str, country: str, enabled: bool = False):
+        """
+        Initialize M3U group metadata.
+
+        Args:
+            plugin_class: M3UProvider class (not instance!)
+            group: Group title from M3U file
+            country: Country code
+            enabled: Whether this provider is enabled
+        """
+        self.plugin_class = plugin_class
+        self.group = group
+        self.country = country.lower()
+        self.enabled = enabled
+        self.instance: Optional[StreamingProvider] = None
+        self._lock = threading.RLock()
+
+        # Extract metadata from class
+        self._extract_metadata()
+
+    def _extract_metadata(self):
+        """Extract metadata from provider class"""
+        self.plugin_name = "m3u"
+
+        # Create name from sanitized group title
+        # IMPORTANT: This MUST match what M3UProvider.provider_name property returns!
+        # See M3UProvider lines 189-194:
+        # clean_name = re.sub(r'[^a-z0-9\s]+', '', self.group_filter.lower())
+        # clean_name = re.sub(r'\s+', '_', clean_name).strip('_')
+        import re
+        clean_name = re.sub(r'[^a-z0-9\s]+', '', self.group.lower())
+        clean_name = re.sub(r'\s+', '_', clean_name).strip('_')
+        self.name = clean_name if clean_name else "m3u"
+
+        # Static metadata
+        self.label = self.group  # Use original group as display label
+        self.is_multi_country = False
+        self.supported_auth_types = self.plugin_class.get_static_auth_types()
+        self.logo = self.plugin_class.get_static_logo()
+        self.supported_countries = ["*"]  # M3U supports all countries
+        self.requires_credentials = False
+
+    def create_instance(self) -> Optional[StreamingProvider]:
+        """
+        Lazily create M3U provider instance.
+
+        This now follows the same pattern as regular providers, ensuring
+        proper initialization including proxy configuration.
+        """
+        if not self.enabled:
+            return None
+
+        with self._lock:
+            if self.instance is None:
+                try:
+                    logger.info(f"Creating M3U group instance: {self.name} (group: {self.group})")
+
+                    # Create instance with group filter - __init__ will handle proxy setup
+                    self.instance = self.plugin_class(
+                        country=self.country,
+                        group_filter=self.group
+                    )
+
+                    logger.debug(f"Successfully created instance for M3U group: {self.name}")
+                except Exception:
+                    logger.exception(f"Failed to create M3U group instance {self.name}")
+                    self.instance = None
+
+            return self.instance
+
+    def destroy_instance(self):
+        """Clean up provider instance"""
+        with self._lock:
+            if self.instance:
+                logger.debug(f"Destroying M3U group instance: {self.name}")
+                self.instance = None
+
+    def set_enabled(self, enabled: bool):
+        """Update enabled status and manage instance accordingly"""
+        self.enabled = enabled
+        if enabled and self.instance is None:
+            self.create_instance()
+        elif not enabled and self.instance is not None:
+            self.destroy_instance()
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert metadata to dictionary for API response"""
+        return {
+            "name": self.name,
+            "label": self.label,
+            "plugin": self.plugin_name,
+            "country": self.country.upper(),
+            "enabled": self.enabled,
+            "instance_ready": self.instance is not None,
+            "requires_credentials": self.requires_credentials,
+            "supported_auth_types": self.supported_auth_types,
+            "logo": self.logo,
+            "is_multi_country": self.is_multi_country,
+            "supported_countries": self.supported_countries,
+            "capabilities": _collect_capabilities(self.instance),
+            # M3U-specific fields
+            "group": self.group,
+            "type": "m3u_group",
+        }
+
+
+class ProviderRegistry:
+    """
+    Core registry for provider discovery, metadata, and lifecycle management.
+    Separated concern: Provider registration and access.
+    """
+
+    def __init__(self):
+        self.providers: Dict[str, StreamingProvider] = {}  # Active instances
+        self.provider_metadata: Dict[str, ProviderMetadata] = {}  # All providers
+        logger.info("ProviderRegistry: Initialized")
+
+    @staticmethod
+    def _is_provider_enabled(provider_name: str, country: Optional[str] = None) -> bool:
+        """Check if a provider is enabled via settings manager."""
+        try:
+            from .settings.provider_enable_manager import ProviderEnableManager
+
+            enable_manager = ProviderEnableManager()
+
+            instance_name = f"{provider_name}_{country}" if country else provider_name
+            return enable_manager.is_provider_enabled(instance_name)
+        except Exception as e:
+            logger.warning(f"Could not check enable status for '{provider_name}': {e}")
+            return True
+
+    def discover_all_providers(self, default_country: str = "DE") -> List[str]:
+        """Discover ALL provider instances and extract metadata."""
+        from streaming_providers import AVAILABLE_PROVIDERS
+
+        logger.info("ProviderRegistry: Discovering provider instances")
+        discovered = []
+
+        for plugin_name, plugin_class in AVAILABLE_PROVIDERS.items():
+            # Special handling for M3U provider - discover groups
+            if plugin_name == "m3u":
+                discovered_groups = self._discover_m3u_groups(plugin_class, default_country)
+                discovered.extend(discovered_groups)
+                continue
+
+            if plugin_class.supports_multiple_countries():
+                country_list = plugin_class.get_static_supported_countries()
+                if country_list == ["*"]:
+                    # Wildcard provider: register one instance for the default country
+                    country_list = [default_country]
+                for country in country_list:
+                    instance_name = f"{plugin_name}_{country}"
+                    enabled = self._is_provider_enabled(plugin_name, country)
+
+                    metadata = ProviderMetadata(
+                        plugin_class, country, enabled, instance_name=instance_name
+                    )
+                    self.provider_metadata[instance_name] = metadata
+                    discovered.append(instance_name)
+
+                    if enabled:
+                        instance = metadata.create_instance()
+                        if instance:
+                            self.providers[instance_name] = instance
+            else:
+                instance_name = plugin_name
+                enabled = self._is_provider_enabled(plugin_name)
+
+                metadata = ProviderMetadata(
+                    plugin_class, default_country, enabled, instance_name=instance_name
+                )
+                self.provider_metadata[instance_name] = metadata
+                discovered.append(instance_name)
+
+                if enabled:
+                    instance = metadata.create_instance()
+                    if instance:
+                        self.providers[instance_name] = instance
+
+        self._migrate_enable_default()
+
+        logger.info(f"ProviderRegistry: Discovered {len(discovered)} provider instances")
+        return discovered
+
+    def _migrate_enable_default(self) -> None:
+        """
+        One-time: freeze the just-discovered enable state in providers_enabled.json
+        and make "disabled" the default for providers without an entry.
+        M3U groups share the single enable key "m3u".
+        """
+        try:
+            from .settings.provider_enable_manager import ProviderEnableManager
+
+            manager = ProviderEnableManager()
+            if not manager.needs_default_migration():
+                return
+            states = {
+                ("m3u" if m.plugin_name == "m3u" else name): m.enabled
+                for name, m in self.provider_metadata.items()
+            }
+            manager.migrate_default_to_disabled(states)
+        except Exception as e:
+            logger.warning(f"ProviderRegistry: enable-default migration skipped: {e}")
+
+    def _discover_m3u_groups(self, plugin_class, default_country: str) -> List[str]:
+        """
+        Discover M3U groups and register each as a separate provider instance.
+
+        Each group-title in M3U files becomes an independent provider.
+
+        IMPORTANT: This now creates lazy metadata instead of eager instances,
+        allowing proper proxy configuration during initialization.
+
+        Args:
+            plugin_class: M3UProvider class
+            default_country: Default country code
+
+        Returns:
+            List of discovered provider instance names
+        """
+        discovered = []
+
+        try:
+            # Import M3UProvider to call static discovery method
+            from streaming_providers.providers.m3u import M3UProvider
+
+            # Discover all unique groups from M3U files
+            # Now includes filename-based fallback for files without group-title
+            groups = M3UProvider.discover_groups(config_dir=None)
+
+            if not groups:
+                logger.warning("M3U: No M3U files found or all files are unreadable")
+                return discovered
+
+            logger.info(f"M3U: Discovered {len(groups)} groups: {', '.join(groups)}")
+
+            # Check if M3U provider is enabled
+            # Use base "m3u" for enable check (all groups share same enable status)
+            enabled = self._is_provider_enabled("m3u", None)
+
+            # Register each group as a separate provider with LAZY METADATA
+            for group in groups:
+                try:
+                    # Create lazy metadata (no instance yet!)
+                    metadata = M3UGroupMetadata(
+                        plugin_class=plugin_class,  # Pass class, not instance
+                        group=group,
+                        country=default_country,
+                        enabled=enabled
+                    )
+
+                    # Register metadata
+                    self.provider_metadata[metadata.name] = metadata
+                    discovered.append(metadata.name)
+
+                    # Only create instance if enabled
+                    if enabled:
+                        instance = metadata.create_instance()
+                        if instance:
+                            self.providers[metadata.name] = instance
+
+                    logger.debug(
+                        f"M3U: Registered group provider '{metadata.name}' "
+                        f"(label: {group}, enabled: {enabled})"
+                    )
+
+                except Exception as e:
+                    logger.error(f"M3U: Failed to register group '{group}': {e}")
+                    continue
+
+            logger.info(f"M3U: Successfully registered {len(discovered)} group providers")
+
+        except ImportError:
+            logger.warning("M3U: M3UProvider not available for group discovery")
+        except Exception as e:
+            logger.error(f"M3U: Error during group discovery: {e}")
+
+        return discovered
+
+    def get_provider(self, provider_name: str) -> Optional[StreamingProvider]:
+        """Get provider instance, creating it lazily if needed."""
+        provider = self.providers.get(provider_name)
+        if provider:
+            return provider
+
+        metadata = self.provider_metadata.get(provider_name)
+        if not metadata or not metadata.enabled:
+            return None
+
+        provider = metadata.create_instance()
+        if provider:
+            self.providers[provider_name] = provider
+        return provider
+
+    def set_provider_enabled(self, provider_name: str, enabled: bool) -> bool:
+        """Enable or disable a provider dynamically."""
+        metadata = self.provider_metadata.get(provider_name)
+        if not metadata:
+            logger.error(f"Cannot enable/disable unknown provider '{provider_name}'")
+            return False
+
+        metadata.set_enabled(enabled)
+
+        if enabled and metadata.instance:
+            self.providers[provider_name] = metadata.instance
+        elif not enabled and provider_name in self.providers:
+            del self.providers[provider_name]
+
+        try:
+            from .settings.provider_enable_manager import ProviderEnableManager
+
+            enable_manager = ProviderEnableManager()
+            success, message = enable_manager.set_provider_enabled(provider_name, enabled)
+            return success
+        except Exception as e:
+            logger.error(f"Error updating enable status: {e}")
+            return False
+
+    def reinitialize_provider(self, provider_name: str) -> bool:
+        """Reinitialize a provider instance."""
+        metadata = self.provider_metadata.get(provider_name)
+        if not metadata or not metadata.enabled:
+            return False
+
+        try:
+            # Drop the registry's reference first: if re-creation fails we
+            # must not keep serving the instance the metadata already forgot.
+            self.providers.pop(provider_name, None)
+            metadata.destroy_instance()
+            new_instance = metadata.create_instance()
+            if new_instance:
+                self.providers[provider_name] = new_instance
+                return True
+            return False
+        except Exception as e:
+            logger.error(f"Failed to reinitialize '{provider_name}': {e}")
+            return False
+
+    def get_all_providers_metadata(self) -> List[Dict[str, Any]]:
+        """Get metadata for ALL provider instances."""
+        return [m.to_dict() for m in self.provider_metadata.values()]
+
+    def list_providers(self) -> List[str]:
+        """List enabled provider names."""
+        return list(self.providers.keys())
+
+    def list_all_providers(self) -> List[str]:
+        """List ALL provider names (enabled + disabled)."""
+        return list(self.provider_metadata.keys())
+
+    def get_enabled_providers(self) -> List[str]:
+        """Get list of enabled provider names."""
+        return [name for name, m in self.provider_metadata.items() if m.enabled]
+
+    def clear_providers(self):
+        """Clear all providers."""
+        self.providers.clear()
+        logger.info("ProviderRegistry: Cleared all providers")

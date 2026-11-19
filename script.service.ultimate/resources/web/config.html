@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Ultimate Backend Configuration</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <link rel="stylesheet" href="config.css">
+</head>
+<body>
+    <div class="container">
+        <header class="header">
+            <h1><i class="fas fa-broadcast-tower"></i> Ultimate Backend Config</h1>
+            <p>Configure your streaming providers, credentials, and proxy settings</p>
+        </header>
+
+        <main class="card">
+            <div class="card-header">
+                <h2><i class="fas fa-sliders-h"></i> Configuration Dashboard</h2>
+                <div class="btn-group">
+                    <button id="btn-export" class="btn btn-success btn-sm">
+                        <i class="fas fa-download"></i> Export
+                    </button>
+                    <button id="btn-import" class="btn btn-primary btn-sm">
+                        <i class="fas fa-upload"></i> Import
+                    </button>
+                </div>
+            </div>
+
+            <div class="tabs">
+                <div class="tab active" data-tab="credentials">
+                    <i class="fas fa-key"></i> Credentials
+                </div>
+                <div class="tab" data-tab="proxy">
+                    <i class="fas fa-network-wired"></i> Proxy
+                </div>
+                <div class="tab" data-tab="epg-mapping">
+                    <i class="fas fa-satellite-dish"></i> EPG Mapping
+                </div>
+                <div class="tab" data-tab="advanced">
+                    <i class="fas fa-cogs"></i> Advanced
+                </div>
+            </div>
+
+            <!-- Credentials Tab -->
+            <div id="tab-credentials" class="tab-content active">
+                <div class="card-body">
+                    <div class="alert alert-info">
+                        <i class="fas fa-info-circle"></i>
+                        <div>
+                            <strong>Credentials Setup</strong>
+                            <p>Enter your login credentials for each streaming provider. Some providers like magenta2 don't require manual credentials.</p>
+                        </div>
+                    </div>
+
+                    <div id="credentials-container" class="providers-grid">
+                        <div class="empty-state" id="loading-providers">
+                            <i class="fas fa-spinner loader"></i>
+                            <p>Loading providers...</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Proxy Tab -->
+            <div id="tab-proxy" class="tab-content">
+                <div class="card-body">
+                    <div class="alert alert-info">
+                        <i class="fas fa-info-circle"></i>
+                        <div>
+                            <strong>Proxy Configuration</strong>
+                            <p>Configure proxy settings for each provider. This is useful if you need to route traffic through a specific proxy server.</p>
+                        </div>
+                    </div>
+
+                    <div id="proxy-container" class="providers-grid">
+                        <div class="empty-state" id="loading-proxy">
+                            <i class="fas fa-spinner loader"></i>
+                            <p>Loading proxy configurations...</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Advanced Tab -->
+            <div id="tab-advanced" class="tab-content">
+                <div class="card-body">
+                    <div class="config-section">
+                        <h3><i class="fas fa-file-export"></i> Import/Export Configuration</h3>
+                        <p>Export all settings to a JSON file or import from an existing configuration.</p>
+
+                        <div class="btn-group">
+                            <button id="btn-export-json" class="btn btn-success">
+                                <i class="fas fa-file-export"></i> Export to JSON
+                            </button>
+                            <button id="btn-import-json" class="btn btn-primary">
+                                <i class="fas fa-file-import"></i> Import from JSON
+                            </button>
+                        </div>
+                    </div>
+
+                    <div class="config-section">
+                        <h3><i class="fas fa-code"></i> Raw Configuration Editor</h3>
+                        <p>Advanced users can edit the raw JSON configuration:</p>
+                        <textarea id="json-editor" class="json-editor" placeholder="Paste JSON configuration here..."></textarea>
+                        <div class="btn-group" style="margin-top: 15px;">
+                            <button id="btn-apply-json" class="btn btn-primary">
+                                <i class="fas fa-check"></i> Apply Configuration
+                            </button>
+                        </div>
+                    </div>
+
+                    <div class="config-section">
+                        <h3><i class="fas fa-trash-alt"></i> Danger Zone</h3>
+                        <div class="alert alert-error">
+                            <i class="fas fa-exclamation-triangle"></i>
+                            <div>
+                                <strong>Warning: Irreversible Actions</strong>
+                                <p>These actions cannot be undone. Make sure you have a backup.</p>
+                            </div>
+                        </div>
+
+                        <div class="btn-group">
+                            <button id="btn-clear-all" class="btn btn-danger">
+                                <i class="fas fa-broom"></i> Clear All Configurations
+                            </button>
+                            <button id="btn-test-connection" class="btn btn-success">
+                                <i class="fas fa-wifi"></i> Test API Connection
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div id="tab-epg-mapping" class="tab-content">
+                <div class="card-body">
+                    <div class="alert alert-info">
+                        <i class="fas fa-info-circle"></i>
+                        <div>
+                            <strong>EPG Channel Mapping</strong>
+                            <p>Map provider channels to EPG IDs for electronic program guide data. Fuzzy matching suggests possible matches based on channel names.</p>
+                        </div>
+                    </div>
+
+                    <!-- EPG Mapping Container (loaded by epg_mapping.js) -->
+                    <div id="epg-mapping-container">
+                        <div class="empty-state" id="epg-loading">
+                            <i class="fas fa-satellite-dish fa-spin"></i>
+                            <p>Loading EPG Mapping...</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+        </main>
+
+        <footer style="text-align: center; margin-top: 30px; color: white; opacity: 0.8;">
+            <p>Ultimate Backend &copy; 2024 | Service running on <span id="service-url">...</span></p>
+        </footer>
+    </div>
+
+    <!-- Import Modal -->
+    <div id="import-modal" class="modal-overlay">
+        <div class="modal-content">
+            <h3><i class="fas fa-file-import"></i> Import Configuration</h3>
+            <p>Upload a JSON configuration file:</p>
+            <input type="file" id="import-file" accept=".json">
+            <div class="btn-group modal-buttons">
+                <button id="btn-cancel-import" class="btn btn-danger">Cancel</button>
+                <button id="btn-confirm-import" class="btn btn-success">Import</button>
+            </div>
+        </div>
+    </div>
+
+</body>
+</html>

@@ -1,0 +1,86 @@
+# Migration brief — `<key>` (v1 → v2)
+
+Fill this in **from the migration pack** before the migration starts, and hand it
+to the migrator together with `pack.txt` and `before.json`. A migrator should not
+have to ask anything that is answered here. Anything marked ❓ that you cannot
+answer is a blocker — stop and get the answer; do not guess.
+
+```bash
+python -m streaming_providers.base.testing.migration_pack <key> --repo <repo> \
+    --extra-root <kodi addon> --extra-root <pvr addon> -o pack.txt
+python -m streaming_providers.base.testing.migration_pack <key> --json before.json
+```
+
+## 1. Identity
+| | |
+|---|---|
+| Directory / registry key / `provider_name` / credentials key | ❓ all equal? (§4) |
+| Class name | |
+| `SUPPORTED_COUNTRIES` (pack §1) | `[]` / one entry / several |
+| **Country the registry really passes** vs. the constructor default vs. the provider's real country | ❓ three values, they differ more often than not (movetv: `"DE"` / `"SI"` / `"RS"`); stored credentials, sessions and proxy settings are keyed by lower-case country (README §4) |
+| How the registry calls the constructor (pack §1, source of `create_instance`) | ❓ `cls(country=…)`? `config`? extras? |
+| Constructor signature the migrated class must keep | |
+| Extra `ctor_kwargs` the contract test needs | |
+| **Id grammar**: how are live ids and VOD ids told apart? (→ `handles_content_id` on both managers) | ❓ |
+| **Routing**: id pattern each manager claims, and the module that owns the grammar (`ids.py`) | ❓ one pure module; predicates complementary? |
+
+## 2. Capabilities (what v1 really has)
+channels ☐  vod ☐  epg ☐  recordings ☐  favorites ☐  bookmarks ☐  catchup ☐  drm ☐  timers ☐(not delegated)  events ☐(not delegated)
+
+**Completeness check of the supplied v1 files (README §12.0b):** `grep -n "unchanged\|^\s*pass$"` — any placeholder body? ❓ (a stubbed capability stays unregistered until the body exists)
+
+For each: does a v1 manager class already exist? Does it subclass the ABC? Does it follow the 4-collaborator
+constructor, or take the provider (`__init__(self, provider)`)? ❓
+
+## 3. Decisions (README reference)
+| Decision | Answer | Evidence (pack section) |
+|---|---|---|
+| Auth variant (§9): A native / B session adapter | | where does the login live? |
+| `DRM_IN_MANAGERS` (§11): folded / dedicated / none | | do manifest and DRM share one response? |
+| `HEADERS_FROM_MANAGERS` (§10) | | do v1 manager header hooks exist and are they dead code? what does the legacy helper (pack §3) do? |
+| Shared state: entitlement / profile / … (§5.1) | session / dedicated collaborator / cache / helper | every back-reference in pack §4 mapped to a row |
+| Credentials API (`set_user_credentials`, `get_auth_details`, …) | keep / drop | callers found (pack §5) **and** does the v1 surface (`before.json`) define them? Dropping a method v1 has is a REMOVED line |
+| Token buffer(s) in the authenticator (grep `expires_in -`) | keep (reason: ___) / remove (device test: ___) | never remove by reflex (§9) |
+| **Token validity model** | expiry-based / server-validated (a network call inside `authenticate()`?) | server-validated → validate once + 401 recovery (§9); count the calls per request today |
+| **`success=false` / empty answers, per endpoint** | required (raise) / optional (empty or `None`) | rule in §8; one row per endpoint |
+| **Ids that cannot be told apart** (live vs VOD both numeric) | who owns numeric ids; which manager claims nothing | §7 |
+| **Channel subclass / API-internal ids** | move to a record in the ChannelManager; extra `to_dict()` keys: ___ | external users of the removed keys (pack §5, addon repos) |
+| **Types named like base types** (`VodPage`, …) | rename to: ___ | §12.2 |
+| **Legacy properties not delegated** (`uses_dynamic_manifests`, `requires_manifest_context`, `supports_catchup`, label/logo/auth types) | keep (v1 value ≠ default) / delete | check the legacy mixin default |
+| **Capabilities that must stay unregistered** (stub bodies) | list + the flag that enables them | §12.2 |
+| **Opt-in base flags needed** (`CATCHUP_HEADERS_ON_MANIFEST_CALL`, `EpgManager.ISOLATE_GRID_FAILURES`) | yes / no | §6.3, §6.6 — or a local override until the base change is merged |
+| **`operation=` values passed to the HTTP manager** | keep v1 strings / use `"api"` | §8 |
+| Provider-specific exceptions callers rely on | are they `ProviderError` subclasses? if not: make them so or `passthrough=` in `transport_errors` | `issubclass(X, ProviderError)` |
+| `get_events` / `enrich_channel_data` / `get_program_details` | real implementation → keep on provider; inert stub → delete | §12.2 |
+| Dead v1 methods (`enrich_channel_data`, `populate_streaming_data`, …) | no caller → delete; caller → move to provider unchanged | grep result (pack §5): ___ |
+| Manager method renames (`get_manifest` → `get_channel_manifest`, …) | list | §12.2 |
+| Failure behaviour (§8, §12.5) | v1 returns `[]`/`None` → v2 raises | OK for the UI? |
+| VOD return shape | list / dict / `VodPage` | wrap with `normalize_vod_result` |
+| **Pagination** (§6.2) | per endpoint: honours offset? v1 default size? | `next_cursor` only where offset is honoured; full-list endpoints keep their size, `next_cursor=None` |
+| **Authenticator failure behaviour** (§9) | permanent exceptions (rejected credentials, MFA): ___ ; transient: ___ ; anonymous fallback yes/no | every permanent case raises a typed `AuthError` |
+| **HTTP manager on 4xx/5xx** (§8) | fact: returns the response / raises with `.response` (❓ verified?) | until verified: handle both |
+| **Caches to clear on credential change** (§9, §14) | list (playout, entitlement variants, VOD, …) | cleared in the `on_invalidate` callback |
+| **Shared builders** (§11) | DRM builder: one function used by which managers? | |
+| **Client hints** (§10) | `User-Agent` and `sec-ch-ua*` derived from one constant? | |
+
+## 4. Legacy helpers the provider calls (pack §3)
+| Helper | What it does (read the source) | v2 replacement (§12.6b) |
+|---|---|---|
+| | | |
+
+## 5. External users (pack §5)
+Pack and `before.json` written **outside** the scanned tree? ☐   Kodi / PVR addon repos passed with `--extra-root`? ☐   Files uploaded as a zip (no same-named overwrites)? ☐
+| Where | What it uses | Action (delegate / call-site fix / none) |
+|---|---|---|
+| | | |
+
+## 6. Behaviour changes accepted (§12.5)
+☐ country / storage keys changed (credentials re-entered or key migrated)   ☐ per-call token validation replaced   ☐ `success=false` rule applied   ☐ per-channel catchup window enforced   ☐ typed errors instead of `[]`/`None`   ☐ headers from manager hooks   ☐ capabilities now reachable (list which)   ☐ eager login removed   ☐ token buffer changed (reason recorded)   ☐ other: ______
+
+## 7. Done when
+Definition of done (README §18); `--compare before.json` reviewed — expected: REMOVED = deleted boilerplate/stubs/delegated flags, ADDED = only `_build_*`, `DRM_IN_MANAGERS`, `HEADERS_FROM_MANAGERS` (anything else is unexplained); tests parse and run, **at least one test fails on the v1 shape**; device checklist (§12.7) signed off.
+
+### Device-test result table
+| # (§12.7) | Check | Result | Date | Signed off by |
+|---|---|---|---|---|
+| 1–10 | | | | |

@@ -1,0 +1,521 @@
+# streaming_providers/providers/magentaeu/constants.py
+# ============================================================================
+# Magenta TV Configuration
+# ============================================================================
+
+import hashlib
+import time
+import uuid
+from typing import Dict, Optional
+
+from ..globals import get_identity
+
+# One browser identity for the whole module -- UA, chrome major and any
+# header value that embeds the version all read from it.
+_IDENTITY = get_identity("linux", "chrome")
+
+# Supported countries
+SUPPORTED_COUNTRIES = ["hr", "pl", "me", "at", "hu"]
+
+# Default country
+DEFAULT_COUNTRY = "at"
+
+MAX_TV_LOGO = "https://www.lyngsat.com/logo/corp/mm/max-tv-hr.png"
+MAGENTA_TV_PL_LOGO = "https://magentatv.pl/client/assets/6700c91b4408a2abe2a4.webp"
+MAGENTA_TV_AT_LOGO = "https://m.media-amazon.com/images/I/51XY6Cq3ANL.png"
+
+# Country-specific configuration
+#
+# Every field below was captured from the corresponding country's public
+# entry page (window.APP_CONSTANTS in the inline config blob) on 2026-10-28:
+#   AT: https://tv.magenta.at
+#   HR: https://mojmaxtv.hrvatskitelekom.hr
+#   ME: https://magentatv.me
+#   PL: https://magentatv.pl
+#   HU: https://player.telekomtvgo.hu
+#
+# Fields that are NOT in the blob (rsa_key) stay hand-maintained. Fields
+# that ARE in the blob are duplicated here verbatim; magentaeu_version_probe.py
+# can diff the two.
+COUNTRY_CONFIG = {
+    "hr": {
+        "base_url": "https://mojmaxtv.hrvatskitelekom.hr",
+        "bifrost_url": "https://tv-hr-prod.yo-digital.com/hr-bifrost",
+        "natco_key": "l2lyvGVbUm2EKJE96ImQgcc8PKMZWtbE",
+        "app_key": "GWaBW4RTloLwpUgYVzOiW5zUxFLmoMj5",
+        "language": "hr",
+        "app_version": "02.0.1470",
+        "media_player_type": 1,
+        "login_type": "native",
+        "login_base_url": "https://gateway-hr-proxy.tv.yo-digital.com/hr-idm/P",
+        "rsa_key": """-----BEGIN PUBLIC KEY-----
+MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDMmKReuzuaCk10Wa6vv4ybcqjVN3cruj27IRp9YhdgEw9jcG728Aj9s60mY8B/czzW5ntKJQktyBRBZ98BKznRWBrVN/n9JR/m1UDc38PW4BPe4z5VtBe99dyFcJQ1VJij6HG0BFtw3isPR5NAUAAyGnXpNWKCat5TtBckqVatBQIDAQAB
+-----END PUBLIC KEY-----""",
+    },
+    "pl": {
+        "base_url": "https://magentatv.pl",
+        "bifrost_url": "https://tv-pl-prod.yo-digital.com/pl-bifrost",
+        "natco_key": "ovINYLVrQsLj8wPDQzNYotQMkFha9PFF",
+        "app_key": "2zjAjpJ6dRfHR1nIwF47jz75g7Qf4F6z",
+        "language": "pl",
+        "app_version": "02.0.1540",
+        "media_player_type": 1,
+        "login_type": "native",
+        "login_base_url": "https://gateway-pl-proxy.tv.yo-digital.com/pl-idm/P",
+        "rsa_key": """-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAxTkEaSufgfBKbzBAHRzSQreMYYCAg4wtjk44A31qVrt0/IaBNbAlvDNEWmB9kwZXK6s41XiPg1k/xsWNoug0nIU1eTEeTsRDwrMzxwYyn5ObO1jylBK0mEAmcl/cEk8A+DqW+raxoWSNq6IH4pciO3QVxeAzIP73FSBrcj81LEeDQsJY6ySbZ1mcDD1/axuCrUm2masJq3nifNOEZG7mAiy5pvoN54grldvXuc8nBne9tdMnCFRisRIO7f2KG5pQVqtLh41aeRTD0eg9c7SWYDhTcRb5MA+PqluZrtwQ3+J7kBGGlxkYHuQ10slR6YUqEELdd85CE7DtMx+PcGLxWwIDAQAB
+-----END PUBLIC KEY-----""",
+    },
+    "me": {
+        "base_url": "https://magentatv.me",
+        "bifrost_url": "https://tv-me-prod.yo-digital.com/me-bifrost",
+        "natco_key": "ANKB5xVVywklLUd9WtEOh8eyLnlAypTM",
+        "app_key": "erYJuNj5fnVXtRgjkr4scxbr3oEkM4I4",
+        "language": "me",
+        "app_version": "02.0.1570",
+        "media_player_type": 1,
+        "login_type": "native",
+        "login_base_url": "https://gateway-me-proxy.tv.yo-digital.com/me-idm/P",
+        "rsa_key": """-----BEGIN PUBLIC KEY-----
+MIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEApoovXHgusvwv7S0cdg+xQYuY3Kb/J50n3GKpW4UmH4xG8NCAD6PBHPKGlVYl6sAnLXofJeq0DsXZJ9xFGH1wTQdd3hxwhGrigstluu4PbpiVRjrFe9AuZto+/Hb0+Ljr5BKFgNMYhpZOaBWgjkqtYWFyMzB1v3VtgUURqxyzMhgiPoCcqYynnqK1weJLGEMSZNlHeWwX46VlK/JqIwPw2ajl5IwvQFzY6BEQvfwXVJxIcvQwkcmeR1A3ACE1E1tvrATb1EPNeKh/E6Kukb8EGTB1O3WJa4IrdX6HI3BJLXftLZ9Y55HuHa+GrGkJRJvchxYCugxgHKSqNOnsT8FWYm1gdZZ6/i/jPo7/tpEdd2U6FxG7/I4rcpk2FzSSd3LKEHGf5v1V982Idbrlm+1LfsjoTx5Go2M8+uBR92pV0qSQlB4YXgQQgqpDUq9f9TwN67nj2jfRECR2hBITkK3+sC9ZxSHYg4Cp3ycHqetxUJ21kVmO6jMG+JsBHLuDKCIc3yrHXHBwhZt4XOhH6K564pUKBOfbe9mZlGrttEla0FK9B/WM315QQ9WgHA5pFyDFmjsB4MvFqKrbsrVUxDZM1COHVC7QbyEte45BDDO/amaB1aa6st5mNIm22m0s0jW8flHarGuulCDNBt9jHI6MnYLb3wpVj00b62Vmx1FX9qkCAwEAAQ==
+-----END PUBLIC KEY-----""",
+    },
+    "at": {
+        "base_url": "https://tv.magenta.at",
+        "bifrost_url": "https://tv-at-prod.yo-digital.com/at-bifrost",
+        "natco_key": "NZu7aIg1vFTNLwHcb0Kjhqk54ql9RJj5",
+        "app_key": "CTnKA63ruKM0JM1doxAXwwyQLLmQiEiy",
+        "language": "de",
+        "app_version": "02.0.1470",
+        "media_player_type": 1,
+        "login_type": "native",
+        "login_base_url": "https://gateway-at-proxy.tv.yo-digital.com/at-idm/P",
+        "rsa_key": """-----BEGIN PUBLIC KEY-----
+MIIBIDANBgkqhkiG9w0BAQEFAAOCAQ0AMIIBCAKCAQEA0EsuGonW8+y5Oq2Hopru5oFCaXEDMBrWPDkzIeY1Vvot3z/l9Q3/bcUQV3Yo6DvbhlARQnMeqiKJ5dutZmdxuj+nhZq9FcL20RUywqGnxTCHaGAEb05Qlovu7Rbld2GeJa4nFP1RY5glUlr/DYVB+tIHqPfZVUSc1PS+l5QkB9TJir57ALxERBJGjT5vhQixXGf6IqmLkxm1okIbuGJa2ttmSWNq0OVi2cF40ZsV64ly7a3m6n2WBYmhqd3ghSprNHXwJBwYwu1L+9CF9oLQXHs9cUDhqyQB+3iDU2Ro/rtZsGcnvnIiDHRIWZ94zcOTOpdUH4pBujc8jF3qdw99UwIBJQ==
+-----END PUBLIC KEY-----""",
+    },
+    "hu": {
+        "base_url": "https://player.telekomtvgo.hu",
+        # HU's BFF has no country prefix in the path (unlike the other four).
+        "bifrost_url": "https://tv-hu-prod.yo-digital.com/bifrost",
+        "natco_key": "Tydx7H7fJO6HxgjvJok0ZhVWFmX3om0P",
+        "app_key": "exSJHBiSAN6wAAeqdWLdTUfdTi2PNark",
+        "language": "hu",
+        "app_version": "02.0.1570",
+        # HU serves media_player_type 0, not 1. This is the trailing segment
+        # of X_USER_AGENT and differs from the other four countries.
+        "media_player_type": 0,
+        # HU uses the "web" login flow (not "native"), with a different
+        # gateway host (external-gateway.oa.yo-digital.com, centralauth-prod)
+        # than the four native-login countries.
+        "login_type": "web",
+        "login_base_url": "https://external-gateway.oa.yo-digital.com/centralauth-prod/hu/P",
+        "rsa_key": """-----BEGIN PUBLIC KEY-----
+MIIBIDANBgkqhkiG9w0BAQEFAAOCAQ0AMIIBCAKCAQEA0EsuGonW8+y5Oq2Hopru5oFCaXEDMBrWPDkzIeY1Vvot3z/l9Q3/bcUQV3Yo6DvbhlARQnMeqiKJ5dutZmdxuj+nhZq9FcL20RUywqGnxTCHaGAEb05Qlovu7Rbld2GeJa4nFP1RY5glUlr/DYVB+tIHqPfZVUSc1PS+l5QkB9TJir57ALxERBJGjT5vhQixXGf6IqmLkxm1okIbuGJa2ttmSWNq0OVi2cF40ZsV64ly7a3m6n2WBYmhqd3ghSprNHXwJBwYwu1L+9CF9oLQXHs9cUDhqyQB+3iDU2Ro/rtZsGcnvnIiDHRIWZ94zcOTOpdUH4pBujc8jF3qdw99UwIBJQ==
+-----END PUBLIC KEY-----""",
+    },
+}
+
+# ============================================================================
+# Application Configuration
+# ============================================================================
+
+# APP_VERSION, MEDIA_PLAYER_TYPE and LOGIN_TYPE are per-country (see
+# COUNTRY_CONFIG above). They are NOT module-level constants; there is no
+# "default" value that applies to all five countries. Callers that used to
+# read APP_VERSION directly should call get_app_version(country) instead.
+#
+# OS and BROWSER are shared across all countries.
+OS = "Linux"
+BROWSER = "Chrome"
+BROWSER_VERSION = _IDENTITY.chrome_major
+DEVICE_NAME = f"{OS} - {BROWSER}"
+
+# ============================================================================
+# Device Configuration
+# ============================================================================
+
+DEVICE_MODEL = "WEB"
+DEVICE_TYPE = "WEB"
+DEVICE_OS = OS
+DEVICE_MANUFACTURER = f"{OS} x86_64"
+DEVICE_CONCURRENCY_PARAM = "TVSOA-restriction-unmanagedDeviceStreamLimit"
+
+# User agent configuration (shared; not country-dependent).
+USER_AGENT = _IDENTITY.user_agent
+
+# X_USER_AGENT is country-dependent (it embeds app_version and
+# media_player_type). Use get_x_user_agent(country) to build it.
+# The shape is:
+#   "{device_model}|{device_type}|{browser}-{browser_version}|{app_version}|{media_player_type}"
+# which resolves to e.g. "web|web|chrome-156|02.0.1470|1" for AT.
+
+# ============================================================================
+# API Endpoints
+# ============================================================================
+
+# Base API URLs
+GATEWAY_BASE_URL = "https://gateway-{natco}-proxy.tv.yo-digital.com"
+
+# API endpoints
+API_ENDPOINTS = {
+    "LOGIN": GATEWAY_BASE_URL + "/{natco}-idm/P/onboarding/login",
+    "REFRESH_TOKEN": GATEWAY_BASE_URL + "/{natco}-idm/P/onboarding/refresh-token",
+    "UPGRADE_TOKEN": GATEWAY_BASE_URL + "/{natco}-idm/P/onboarding/upgrade-token",
+    "USER_ACCOUNT": "{bifrost_url}/user/account",
+    "EPG_CHANNELS": "{bifrost_url}/epg/channel",
+    "STARTUP_PAGE": "{base_url}/epg",
+}
+
+# Widevine configuration
+WV_URL = "https://widevine.entitlement.theplatform.eu/wv/web/ModularDrm/getRawWidevineLicense"
+ACC_URL = "http://access.auth.theplatform.com/data/Account"
+
+# ============================================================================
+# Authentication Configuration
+# ============================================================================
+
+# Login context (unchanged; the "login" scope is the same for all countries).
+LOGIN_CONTEXT = "login"
+# LOGIN_TYPE is per-country (see COUNTRY_CONFIG). Use get_login_type(country).
+CHANNEL_ID = "Tv"
+
+# Authentication flows and steps
+AUTH_FLOWS = {
+    "USERNAME_PASSWORD_LOGIN": "USERNAME_PASSWORD_LOGIN",
+    "START_UP": "START_UP",
+}
+
+AUTH_STEPS = {
+    "GET_ACCESS_TOKEN": "GET_ACCESS_TOKEN",
+    "REFRESH_TOKEN": "REFRESH_TOKEN",
+    "UPGRADE_TOKEN": "UPGRADE_TOKEN",
+    "GET_USER_ACCOUNT": "GET_USER_ACCOUNT",
+    "EPG_CHANNEL": "EPG_CHANNEL",
+}
+
+CALL_TYPES = {"GUEST_USER": "GUEST_USER", "AUTH_USER": "AUTH_USER"}
+
+# ============================================================================
+# DRM Configuration
+# ============================================================================
+
+DRM_SYSTEM_WIDEVINE = "widevine"
+
+# DRM request headers
+DRM_REQUEST_HEADERS = {
+    "Content-Type": "application/octet-stream",
+    "User-Agent": USER_AGENT,
+}
+
+# ============================================================================
+# Request Configuration
+# ============================================================================
+
+DEFAULT_REQUEST_TIMEOUT = 30
+DEFAULT_MAX_RETRIES = 3
+
+# ============================================================================
+# Guest Session Configuration
+# ============================================================================
+
+# How long a device_id/session_id pair (obtained from the startup-page
+# cookies) is trusted before it gets re-validated against the server again.
+# The real server-side TTL is unknown/unmeasured -- this is a conservative
+# starting point, not an observed value. Tighten or loosen once we have
+# data on how long a pair actually survives server-side.
+GUEST_SESSION_TTL_SECONDS = 6 * 60 * 60  # 6 hours
+
+# ============================================================================
+# Headers Configuration
+# ============================================================================
+
+BASE_HEADERS = {
+    "User-Agent": USER_AGENT,
+}
+
+AUTH_HEADERS_BASE = {
+    "User-Agent": USER_AGENT,
+    "Accept": "application/json",
+    "Content-Type": "application/json",
+    # X-User-Agent is country-dependent; get_guest_headers() / build_auth_headers()
+    # fill it in from get_x_user_agent(country).
+    "Tenant": "tv",
+}
+
+DEVICE_DENSITY = "ldpi"
+ACCEPT_LANGUAGE = "de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7"
+
+# ============================================================================
+# Content Configuration
+# ============================================================================
+
+CONTENT_TYPE_LIVE = "LIVE"
+STREAMING_FORMAT_DASH = "dash"
+
+# ============================================================================
+# Device Management
+# ============================================================================
+
+MANAGE_DEVICE = False
+BROADCASTING_STREAM_LIMITATION_APPLIES = False
+
+
+# ============================================================================
+# Per-country accessors
+# ============================================================================
+#
+# These replace the old module-level APP_VERSION / LOGIN_TYPE /
+# MEDIA_PLAYER_TYPE constants. auth.py and provider.py should call them
+# with the country they are operating on; nothing in this file assumes AT.
+
+def get_country_config(country: str) -> dict:
+    """Get configuration for specific country"""
+    return COUNTRY_CONFIG.get(country, COUNTRY_CONFIG[DEFAULT_COUNTRY])
+
+
+def get_base_url(country: str) -> str:
+    """Get base URL for country"""
+    return get_country_config(country)["base_url"]
+
+
+def get_bifrost_url(country: str) -> str:
+    """Get bifrost URL for country"""
+    return get_country_config(country)["bifrost_url"]
+
+
+def get_natco_key(country: str) -> str:
+    """Get natco key for country"""
+    return get_country_config(country)["natco_key"]
+
+
+def get_app_key(country: str) -> str:
+    """Get app key for country"""
+    return get_country_config(country)["app_key"]
+
+
+def get_language(country: str) -> str:
+    """Get language for country"""
+    return get_country_config(country)["language"]
+
+
+def get_rsa_key(country: str) -> str:
+    """Get RSA public key for country"""
+    return get_country_config(country)["rsa_key"]
+
+
+def get_app_version(country: str) -> str:
+    """Get APP_VERSION for country (per-country; see COUNTRY_CONFIG)."""
+    return get_country_config(country)["app_version"]
+
+
+def get_media_player_type(country: str) -> int:
+    """Get MEDIA_PLAYER_TYPE for country (1 except HU, which is 0)."""
+    return get_country_config(country)["media_player_type"]
+
+
+def get_login_type(country: str) -> str:
+    """Get LOGIN_TYPE for country ("native" except HU, which is "web")."""
+    return get_country_config(country)["login_type"]
+
+
+def get_login_base_url(country: str) -> str:
+    """Get NATIVE_LOGIN_BASE_URL for country."""
+    return get_country_config(country)["login_base_url"]
+
+
+def get_x_user_agent(country: str) -> str:
+    """
+    Build X-User-Agent for country.
+
+    Shape: "{device_model}|{device_type}|{browser}-{browser_version}|{app_version}|{media_player_type}"
+    e.g. AT: "web|web|chrome-156|02.0.1470|1"
+         HU: "web|web|chrome-156|02.0.1570|0"
+    """
+    return (
+        f"{DEVICE_MODEL.lower()}|{DEVICE_TYPE.lower()}|"
+        f"{BROWSER}-{BROWSER_VERSION}|{get_app_version(country)}|"
+        f"{get_media_player_type(country)}"
+    )
+
+
+def get_base_headers() -> Dict[str, str]:
+    """Get base headers for requests"""
+    return {
+        "User-Agent": USER_AGENT,
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+
+
+def get_guest_headers(country: str, device_id: str, session_id: str) -> Dict[str, str]:
+    """Get headers for guest/unauthenticated requests"""
+    headers = {
+        "accept": "application/json, text/plain, */*",
+        "accept-language": ACCEPT_LANGUAGE,
+        "app_key": get_app_key(country),
+        "app_version": get_app_version(country),
+        "bff_token": "",
+        "cache-control": "no-cache",
+        "device-density": DEVICE_DENSITY,
+        "device-id": device_id,
+        "device-name": DEVICE_NAME,
+        "origin": get_base_url(country),
+        "pragma": "akamai-x-cache-on,akamai-x-check-cacheable,akamai-x-get-cache-key",
+        "priority": "u=1, i",
+        # Bump only the two Chrome-version tokens; keep the captured brand
+        # order and the GREASE brand ("Not;A=Brand";v="24") exactly as
+        # observed. This string is not assembled from globals -- it is a
+        # browser capture, and a WAF that parses sec-ch-ua order would
+        # reject a reassembled value.
+        "sec-ch-ua": (
+            f'"Google Chrome";v="{BROWSER_VERSION}", '
+            f'"Chromium";v="{BROWSER_VERSION}", '
+            f'"Not;A=Brand";v="24"'
+        ),
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Linux"',
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "cross-site",
+        "tenant": "tv",
+        "user-agent": USER_AGENT,
+        "x-call-type": "GUEST_USER",
+        "x-request-session-id": session_id,
+        "x-request-tracking-id": str(uuid.uuid4()),
+        "x-user-agent": get_x_user_agent(country),
+    }
+    return headers
+
+
+# ============================================================================
+# Header Generation with x-txn-id
+# ============================================================================
+
+
+def _generate_txn_id(
+    tracking_id: str, session_id: str, device_id: str, call_time: str
+) -> str:
+    """SHA-256(trackingId + sessionId + deviceId + callTime)[:32]"""
+    raw = tracking_id + session_id + device_id + call_time
+    return hashlib.sha256(raw.encode()).hexdigest()[:32]
+
+
+def build_guest_headers(
+    country: str,
+    device_id: str,
+    session_id: str,
+    flow: str,
+    step: Optional[str] = None,
+    tracking_id: Optional[str] = None,
+) -> Dict[str, str]:
+    """
+    Build complete guest headers with x-txn-id.
+
+    Note: device_id and session_id must already be resolved by the caller
+    (via get_guest_session_ids() or similar) before calling this. No
+    fallback UUIDs are generated here -- that's intentional, to avoid a
+    mismatch between the header value actually sent and the value hashed
+    into x-txn-id.
+    """
+    if tracking_id is None:
+        tracking_id = str(uuid.uuid4())
+
+    # Snapshot call_time once -- x-txn-id is derived from it, so both
+    # headers must use the same value.
+    call_time = str(int(time.time() * 1000))
+
+    headers = get_guest_headers(country, device_id, session_id)
+    headers["x-call-time"] = call_time
+    headers["x-tv-flow"] = flow
+    headers["x-request-tracking-id"] = tracking_id
+    headers["x-txn-id"] = _generate_txn_id(tracking_id, session_id, device_id, call_time)
+    if step is not None:
+        headers["x-tv-step"] = step
+    return headers
+
+
+def build_headers_with_txn(
+    base_headers: Dict[str, str],
+    device_id: str,
+    session_id: str,
+    tracking_id: Optional[str] = None,
+    call_time: Optional[str] = None,
+) -> Dict[str, str]:
+    """
+    Add x-txn-id and related headers to any headers dict.
+
+    Args:
+        base_headers: Existing headers to add to
+        device_id: Device ID for x-txn-id calculation -- must be the same
+            value already present as the Device-Id header in base_headers
+        session_id: Session ID for x-txn-id calculation -- must be the same
+            value already present as the x-request-session-id header
+        tracking_id: Optional tracking ID (generated if not provided)
+        call_time: Optional call time (generated if not provided)
+
+    Returns:
+        Headers dict with x-txn-id, x-call-time, x-request-tracking-id added
+    """
+    if tracking_id is None:
+        tracking_id = str(uuid.uuid4())
+
+    if call_time is None:
+        call_time = str(int(time.time() * 1000))
+
+    headers = base_headers.copy()
+    headers.update({
+        "x-request-tracking-id": tracking_id,
+        "x-call-time": call_time,
+        "x-txn-id": _generate_txn_id(tracking_id, session_id, device_id, call_time),
+    })
+    return headers
+
+
+def build_auth_headers(
+    country: str,
+    device_id: str,
+    session_id: str,
+    flow: str,
+    step: str,
+    call_type: str = CALL_TYPES["GUEST_USER"],
+    tracking_id: Optional[str] = None,
+    call_time: Optional[str] = None,
+) -> Dict[str, str]:
+    """
+    Build complete authentication headers with x-txn-id.
+
+    CRITICAL: device_id and session_id fallbacks are resolved ONCE here,
+    then reused for both the Device-Id / x-request-session-id headers and
+    the x-txn-id hash. Resolving `device_id or str(uuid.uuid4())` more than
+    once produces a different random value each time, which would send a
+    Device-Id header that doesn't match what's hashed into x-txn-id.
+    """
+    resolved_device_id = device_id if device_id else str(uuid.uuid4())
+    resolved_session_id = session_id if session_id else str(uuid.uuid4())
+
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "X-User-Agent": get_x_user_agent(country),
+        "X-Call-Type": call_type,
+        "X-Tv-Flow": flow,
+        "X-Tv-Step": step,
+        "x-request-session-id": resolved_session_id,
+        "requestid": str(uuid.uuid4()),
+        "Tenant": "tv",
+        "Origin": get_base_url(country),
+        "App_key": get_app_key(country),
+        "App_version": get_app_version(country),
+        "Device-Id": resolved_device_id,
+        "Device-Name": DEVICE_NAME,
+    }
+
+    return build_headers_with_txn(
+        base_headers=headers,
+        device_id=resolved_device_id,
+        session_id=resolved_session_id,
+        tracking_id=tracking_id,
+        call_time=call_time,
+    )
