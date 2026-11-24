@@ -448,7 +448,7 @@ class KodiNotificationAdapter(NotificationInterface):
                 logger.error("QR generator not available")
                 return None
 
-            logger.info(f"Generating QR code for: {target_url}")
+            logger.info("Generating QR code (<redacted>)")
             start_time = time.time()
 
             png_data = generate_qr_code_png(target_url, size=512)

@@ -204,7 +204,7 @@ class RemoteLoginHandler:
                 f"interval={interval}s, expires_in={expires_in}s"
             )
             if qr_target_url:
-                logger.info(f"QR target URL: {qr_target_url}")
+                logger.info("QR target URL: <redacted>")
 
             return session
 
@@ -260,10 +260,10 @@ class RemoteLoginHandler:
                         # Truncate at the last dot in the URL
                         if "." in decoded_url:
                             shortened_url = decoded_url.rsplit(".", 1)[0]
-                            logger.info(f"Extracted QR target URL: {shortened_url}")
+                            logger.info("Extracted QR target URL: <redacted>")
                             return shortened_url
 
-                        logger.info(f"Extracted QR target URL: {decoded_url}")
+                        logger.info("Extracted QR target URL: <redacted>")
                         return decoded_url
                     else:
                         logger.warning("No 'target' parameter in redirect URL")
@@ -275,7 +275,7 @@ class RemoteLoginHandler:
 
         # Fallback: construct URL from login code
         fallback_url = f"https://telekom.de/tv-login?login_code={login_code}"
-        logger.info(f"Using fallback QR target URL: {fallback_url}")
+        logger.info("Using fallback QR target URL: <redacted>")
         return fallback_url
 
     def poll_for_token(self, session: RemoteLoginSession) -> Optional[Dict[str, Any]]:
