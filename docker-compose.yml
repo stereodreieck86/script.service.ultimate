@@ -13,6 +13,7 @@ services:
     ports:
       - 7777:7777
     environment:
+      - ULTIMATE_SERVER_HOST=0.0.0.0
       - ULTIMATE_PORT=7777
       - ULTIMATE_DEBUG=false
       - ULTIMATE_EPG_URL=https://example.com/epg.xml.gz
